@@ -1,0 +1,37 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Hypha Browser Use</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 13px -apple-system, system-ui, sans-serif; width: 360px; padding: 12px; margin: 0; }
+    h1 { font-size: 14px; margin: 0 0 8px; display: flex; align-items: center; gap: 8px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #bbb; display: inline-block; }
+    .dot.ok { background: #2ecc71; box-shadow: 0 0 6px #2ecc71; }
+    .dot.err { background: #e74c3c; box-shadow: 0 0 6px #e74c3c; }
+    .dot.wait { background: #f39c12; }
+    pre { background: #00000010; padding: 8px; border-radius: 4px; overflow-x: auto; max-height: 220px; }
+    button { padding: 6px 10px; margin-right: 6px; cursor: pointer; }
+    .url { user-select: all; word-break: break-all; }
+    .row { margin-bottom: 6px; }
+    .small { font-size: 11px; opacity: .75; }
+  </style>
+</head>
+<body>
+  <h1><span id="dot" class="dot"></span> Hypha Browser Use</h1>
+  <div class="row"><span class="small">State:</span> <span id="state">…</span></div>
+  <div class="row"><span class="small">Workspace:</span> <span id="ws">…</span></div>
+  <div class="row"><span class="small">Service:</span> <span id="svc">…</span></div>
+  <div class="row"><span class="small">HTTP base:</span></div>
+  <div class="url" id="http">…</div>
+  <div class="row" style="margin-top: 8px">
+    <button id="copy">Copy URL</button>
+    <button id="reconnect">Reconnect</button>
+    <button id="open">Open Hypha dashboard</button>
+  </div>
+  <div class="row"><span class="small">Last error:</span></div>
+  <pre id="err">none</pre>
+  <script src="popup.js"></script>
+</body>
+</html>

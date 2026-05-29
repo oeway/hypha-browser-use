@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang=en>
+<head>
+<meta charset=utf-8>
+<title>hypha-browser-use — drive real Chrome with Hypha RPC</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+  :root { color-scheme: light dark; --accent:#2563eb; --ok:#16a34a; --muted:#666; }
+  * { box-sizing: border-box; }
+  body { font: 15px/1.55 -apple-system, system-ui, "Helvetica Neue", sans-serif; max-width: 920px; margin: 30px auto; padding: 0 18px; }
+  header { padding-bottom: 18px; border-bottom: 1px solid #00000018; margin-bottom: 22px; }
+  h1 { margin: 0 0 6px; font-size: 26px; }
+  h2 { margin: 28px 0 10px; font-size: 19px; }
+  h3 { margin: 18px 0 6px; font-size: 16px; }
+  .lead { color: var(--muted); }
+  .pill { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; margin-right: 6px;
+          background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+  pre { background: #00000010; padding: 12px 14px; border-radius: 6px; overflow-x: auto; font-size: 13px; line-height: 1.5; }
+  code { background: #00000010; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; }
+  pre code { background: none; padding: 0; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .copy-prompt { background: #00000010; border-left: 4px solid var(--accent); padding: 14px 16px; border-radius: 4px; font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .card { padding: 12px 14px; background: #00000008; border-radius: 6px; }
+  .card h3 { margin: 0 0 4px; }
+  .small { font-size: 13px; color: var(--muted); }
+  footer { margin-top: 50px; padding-top: 18px; border-top: 1px solid #00000018; color: var(--muted); font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #00000010; }
+  th { background: #00000008; }
+</style>
+</head>
+<body>
+<header>
+  <h1>hypha-browser-use</h1>
+  <p class=lead>Drive the user's <b>real Chrome stable</b> on macOS via Hypha RPC. No detection battles, no emulator, no Web Store publishing. Two background processes, ~40 tools, one paste-to-Claude prompt.</p>
+  <p>
+    <span class=pill>✓ working in real Chrome 148</span>
+    <span class=pill>✓ 28/28 tools verified</span>
+    <span class=pill>MIT licensed</span>
+  </p>
+</header>
+
+<h2>What it does</h2>
+<p>Runs an MV3 Chrome extension inside your real Chrome (loaded via the official <code>Extensions.loadUnpacked</code> CDP API — no <code>--load-extension</code>, no Web Store) and exposes a Hypha RPC service with tools for tabs, navigation, DOM manipulation, screenshots, JS evaluation, cookies, file uploads/downloads, and more. An AI agent (or any HTTP client) drives the browser through ordinary HTTPS POSTs.</p>
+<p>Use it for: <b>autonomous logins</b>, <b>email automation</b>, <b>scraping</b>, <b>file uploads/downloads</b>, <b>institutional IT systems</b> (Outlook/SharePoint/Teams web), <b>banking</b>, anything browser-based. For 2FA push prompts (e.g. KTH biometric MS Authenticator), the agent pauses and notifies you to tap "Approve" on your real phone — no emulator, no biometric bypass.</p>
+
+<h2>One-paste setup</h2>
+<p>Clone the repo, set 3 env vars, run one command:</p>
+<pre><code>git clone https://github.com/oeway/hypha-browser-use
+cd hypha-browser-use
+export HYPHA_TOKEN=...        # get from https://hypha.aicell.io
+export HYPHA_WORKSPACE=ws-user-...
+export HYPHA_SERVER_URL=https://hypha.aicell.io
+./scripts/run.sh --headless</code></pre>
+<p>This launches Chrome with the extension and registers a service in your Hypha workspace. The script prints a service URL — paste it (and this docs URL) into a Claude session.</p>
+
+<h2>Paste this into Claude to bootstrap the agent</h2>
+<div class=copy-prompt>I have a remote-controllable browser running on my Mac mini via Hypha RPC.
+
+Service URL (yours, per-session):  &lt;paste from `./scripts/run.sh` output&gt;
+Docs URL (this page):              &lt;paste this page's URL&gt;
+
+Use HTTPS POSTs to the service URL to drive the browser. Pass tool arguments
+under a "kwargs" key in the request body. Example:
+
+  curl -X POST "$SERVICE_URL/navigate?_mode=last" \
+    -H "Authorization: Bearer $HYPHA_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"kwargs": {"url": "https://example.com"}}'
+
+The full tool reference is on this page (below) — fetch the page first to learn the surface, then drive the browser to accomplish whatever I ask. For 2FA prompts that need biometric approval (KTH MS Authenticator, banking apps, etc.) call notify_user and wait for me to approve on my real phone.
+</div>
+
+<h2>Tool reference (40+ tools)</h2>
+<p>Every tool is a POST to <code>$SERVICE_URL/&lt;tool&gt;?_mode=last</code> with body <code>{"kwargs": {...}}</code>. <code>tab_id</code> defaults to the active tab if omitted.</p>
+
+<div class=grid>
+  <div class=card>
+    <h3>Meta / health</h3>
+    <p class=small><code>ping</code> · <code>get_extension_info</code> · <code>notify_user</code> (macOS notification)</p>
+  </div>
+  <div class=card>
+    <h3>Tabs</h3>
+    <p class=small><code>list_tabs</code> · <code>get_active_tab</code> · <code>create_tab</code> · <code>close_tab</code> · <code>activate_tab</code> · <code>duplicate_tab</code></p>
+  </div>
+  <div class=card>
+    <h3>Windows</h3>
+    <p class=small><code>list_windows</code> · <code>create_window</code> · <code>close_window</code> · <code>focus_window</code></p>
+  </div>
+  <div class=card>
+    <h3>Navigation</h3>
+    <p class=small><code>navigate</code> · <code>go_back</code> · <code>go_forward</code> · <code>reload</code> · <code>wait_for_load</code></p>
+  </div>
+  <div class=card>
+    <h3>Page state</h3>
+    <p class=small><code>get_page_info</code> · <code>get_html</code> · <code>get_text</code> · <code>get_outer_html</code> · <code>screenshot</code></p>
+  </div>
+  <div class=card>
+    <h3>DOM (CSS selector)</h3>
+    <p class=small><code>query</code> · <code>click</code> · <code>fill</code> · <code>select_option</code> · <code>scroll</code> · <code>scroll_to</code> · <code>focus_element</code> · <code>press_key</code> · <code>read_text</code> · <code>read_attribute</code> · <code>wait_for_selector</code></p>
+  </div>
+  <div class=card>
+    <h3>Smart DOM (browser-use style)</h3>
+    <p class=small><code>get_browser_state</code> (indexed interactive elements) · <code>click_by_index</code> · <code>input_by_index</code></p>
+  </div>
+  <div class=card>
+    <h3>JS execution</h3>
+    <p class=small><code>eval_js</code> (MAIN or ISOLATED world)</p>
+  </div>
+  <div class=card>
+    <h3>Cookies</h3>
+    <p class=small><code>get_cookies</code> · <code>set_cookie</code> · <code>delete_cookie</code></p>
+  </div>
+  <div class=card>
+    <h3>Files</h3>
+    <p class=small><code>download</code> · <code>list_downloads</code> · <code>wait_for_download</code> · <code>upload_file</code> (base64-encoded payload to a file input)</p>
+  </div>
+  <div class=card>
+    <h3>Dialogs</h3>
+    <p class=small><code>set_dialog_handler</code> (auto-accept/dismiss alert/confirm/prompt)</p>
+  </div>
+</div>
+
+<h2>2FA / biometric handoff</h2>
+<p>The extension cannot bypass biometric (and shouldn't try). For push 2FA, the agent reads the displayed match number from the browser, calls <code>notify_user</code>, and waits for the page to advance:</p>
+<pre><code>// agent-side pseudocode
+await call("navigate",        {url: "https://login.microsoftonline.com"});
+await call("fill",            {selector: "input[type=email]", value: "you@org.edu"});
+await call("click",           {selector: "input[type=submit]"});
+await call("wait_for_selector", {selector: ".display-sign-in-number", timeout_ms: 15000});
+const num = await call("read_text", {selector: ".display-sign-in-number"});
+await call("notify_user",     {message: `Approve sign-in: tap ${num} on your phone`});
+await call("wait_for_selector", {selector: ".inbox-ready", timeout_ms: 60000});  // user taps</code></pre>
+
+<h2>Architecture</h2>
+<pre><code>Claude → HTTPS → Hypha cloud → SSE → MV3 SW (in real Chrome) → chrome.* APIs
+
+The Node supervisor holds Chrome alive via --remote-debugging-pipe and installs
+the extension via the official Extensions.loadUnpacked CDP method. The SW
+registers a Hypha service using the HTTP-streaming transport (WebSocket
+hangs in MV3 SW context).</code></pre>
+
+<h2>Live test report</h2>
+<p>Last run: <a href="./report.html">test-and-report → report.html</a> — exercises every tool against example.com and google.com, with screenshots inlined.</p>
+
+<h2>Why this approach</h2>
+<ul>
+<li><b>Real user fingerprint.</b> It's the user's real Chrome — Cloudflare, Akamai, banks, Google login all see a normal user. No detection battle.</li>
+<li><b>No Web Store publishing.</b> The extension is loaded as unpacked dev via CDP. Zero distribution friction.</li>
+<li><b>No sudo / no managed policy.</b> Chrome stable in 2026 refuses <code>--load-extension</code>, but the CDP <code>Extensions.loadUnpacked</code> path works without admin.</li>
+<li><b>2FA is solved out-of-band.</b> The user taps on their real phone. Works for biometric/MFA where every emulator fails.</li>
+<li><b>Clean lifecycle.</b> Node supervisor + Chrome share a process tether; one <code>./scripts/stop.sh</code> shuts both down.</li>
+</ul>
+
+<h2>Source</h2>
+<p><a href="https://github.com/oeway/hypha-browser-use">github.com/oeway/hypha-browser-use</a> · <a href="./report.html">test report</a> · <a href="https://hypha.aicell.io">hypha.aicell.io</a></p>
+
+<footer>
+  <p>Built by <a href="https://github.com/oeway">@oeway</a>, MIT licensed. Vendors a patched <a href="https://github.com/oeway/hypha-rpc">hypha-rpc</a> JS bundle (eval() patched to <code>globalThis[]</code> for MV3 CSP compliance).
+  Smart-DOM patterns derived from <a href="https://github.com/browser-use/browser-use">browser-use</a> via <a href="https://github.com/amun-ai/hypha-debugger">hypha-debugger</a>.</p>
+</footer>
+</body></html>

@@ -1,0 +1,23 @@
+extension/config.js
+extension/lib/hypha-rpc.mjs.orig
+
+# Svamp / Claude Code session state (not source)
+.svamp/
+.claude/local/
+.claude/settings.local.json
+
+# Generated runtime state
+.chrome.pid
+.chrome.log
+.chrome2.log
+.node.pid
+.supervisor.log
+.headless-test.log
+.extension.id
+.hypha-browser-use/
+
+node_modules/
+*.crx
+*.zip
+.DS_Store
+inventory.md

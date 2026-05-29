@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Hypha Browser Use",
+  "short_name": "HyphaBrowserUse",
+  "version": "0.1.0",
+  "description": "Remote-controllable browser automation via Hypha RPC. Lets an AI agent drive any tab/window through chrome.* APIs.",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "activeTab",
+    "storage",
+    "alarms",
+    "cookies",
+    "webNavigation",
+    "notifications",
+    "downloads"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Hypha Browser Use"
+  },
+  "minimum_chrome_version": "120",
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}
