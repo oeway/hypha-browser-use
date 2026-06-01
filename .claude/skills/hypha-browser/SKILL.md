@@ -85,13 +85,30 @@ get_browser_state {tab_id?, viewport_only?} → {url, title, viewport, scroll, e
 click_by_index    {index, tab_id?}
 input_by_index    {index, text, tab_id?}
 
+# CSP-safe alternatives (USE THESE for sites with strict CSP — banks, KTH, etc.)
+click_at      {x, y, tab_id?, mark?}              → {ok, tag, text, click, viewport, element_bounds}
+paste_text    {text, tab_id?}                     → {ok, tag, length}
+press_key_v2  {key, modifiers?, tab_id?}          → {ok, key, tag}   # also mutates value for Backspace/Delete/Enter in inputs
+scroll_by     {dx, dy, tab_id?}                   → {ok, scroll, max, viewport}
+scroll_to_position {x?, y?, tab_id?}              → {ok, scroll}
+
 # JS / cookies / downloads / notifications
-eval_js       {code, tab_id?, world?}             → {ok, value} | {ok:false, error, stack}
+eval_js       {code, tab_id?, world?}             → {ok, value} | {ok:false, error, stack}   # FAILS on CSP-strict pages — prefer click_at/paste_text
 get_cookies   {url}                               → [Cookie]
 delete_cookie {url, name}                         → {success}
 download      {url, filename?, save_as?}         → {download_id}
 notify_user   {message, level?}                   → {ok}    # macOS notification
 ```
+
+## When to prefer the CSP-safe tools
+
+`eval_js` uses `new Function(code)` internally, which is blocked by strict Content Security Policy on many real sites (login.ug.kth.se, banks, gov, MS login pages). All other extension tools are CSP-safe because they ship as compiled functions via `chrome.scripting.executeScript({func, args})`.
+
+**Always prefer:**
+- `click_at` over `eval_js("document.elementFromPoint(...).click()")`
+- `paste_text` over `eval_js("document.activeElement.value = ...")`
+- `press_key_v2` over `eval_js("...dispatchEvent(new KeyboardEvent(...))")`
+- `scroll_by` over `eval_js("window.scrollBy(...)")`
 
 `tab_id` defaults to the active tab if omitted.
 

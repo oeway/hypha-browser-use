@@ -1,0 +1,695 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hypha-browser remote</title>
+<style>
+  :root { color-scheme: light dark;
+    --bg: var(--svamp-bg, #f5f7fb);
+    --fg: var(--svamp-fg, #1a1f2c);
+    --panel: var(--svamp-panel-bg, #ffffff);
+    --panel-fg: var(--svamp-panel-fg, #1a1f2c);
+    --border: var(--svamp-border, #e2e6ee);
+    --muted: var(--svamp-muted, #6b7280);
+    --accent: var(--svamp-accent, #4f46e5);
+    --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 12px rgba(0,0,0,.04);
+  }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); }
+  body { font: 14px/1.45 -apple-system, "SF Pro Text", system-ui, sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 12px; }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 14px; background: var(--panel); color: var(--panel-fg);
+    border: 1px solid var(--border); border-radius: 10px 10px 0 0;
+    box-shadow: var(--shadow);
+  }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; white-space: nowrap; }
+  header .navbtn {
+    padding: 5px 9px; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 4px;
+    font-size: 14px; cursor: pointer; line-height: 1;
+    -webkit-tap-highlight-color: transparent;
+  }
+  header .navbtn:active { background: var(--accent); color: white; }
+  .tabstrip {
+    display: flex; gap: 4px; overflow-x: auto; padding: 6px 8px;
+    background: var(--panel); border-left: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+  .tabstrip .tab {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 4px 8px 4px 10px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    font-size: 12px; max-width: 200px; flex-shrink: 0; cursor: pointer;
+    color: var(--fg);
+  }
+  .tabstrip .tab.active { background: var(--accent); color: white; border-color: var(--accent); }
+  .tabstrip .tab .ttl {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px;
+  }
+  .tabstrip .tab .x {
+    width: 16px; height: 16px; line-height: 16px; text-align: center;
+    border-radius: 50%; font-size: 11px; opacity: 0.6;
+  }
+  .tabstrip .tab .x:hover { opacity: 1; background: rgba(0,0,0,0.1); }
+  .tabstrip .newtab {
+    padding: 4px 10px; background: transparent; border: 1px dashed var(--border);
+    border-radius: 6px; color: var(--muted); cursor: pointer; flex-shrink: 0;
+  }
+  header .urlbar {
+    flex: 1; display: flex; gap: 6px; min-width: 0;
+  }
+  header .urlbar input {
+    flex: 1; min-width: 0; padding: 5px 10px;
+    font: 12px ui-monospace, SFMono-Regular, monospace;
+    background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 4px; outline: none;
+  }
+  header .urlbar input:focus { border-color: var(--accent); }
+  header .urlbar button {
+    padding: 5px 10px; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 4px;
+    font-size: 12px; cursor: pointer;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #9ca3af; }
+  .dot.ok { background: #10b981; box-shadow: 0 0 0 4px rgba(16,185,129,.15); }
+  .dot.bad { background: #ef4444; box-shadow: 0 0 0 4px rgba(239,68,68,.15); }
+  .shotbox {
+    position: relative; background: #1c1f2a;
+    border-left: 1px solid var(--border); border-right: 1px solid var(--border);
+    outline: none;
+    /* No min-height: let the box shrink to the image's natural aspect so the
+       kbd input overlay (inset:0) lines up exactly with what's visible. */
+    aspect-ratio: 1440 / 813;  /* matches Chrome viewport — adjusts via JS once image loads */
+  }
+  .shotbox.focused { box-shadow: inset 0 0 0 3px var(--accent); }
+  .shot { display: block; width: 100%; height: auto; cursor: crosshair; user-select: none; }
+  .shotbox .loading {
+    position: absolute; inset: 0; display: grid; place-items: center;
+    color: #888; font-size: 12px; pointer-events: none;
+  }
+  .focusbadge {
+    position: absolute; top: 6px; right: 8px; padding: 2px 8px;
+    background: var(--accent); color: white; font-size: 11px;
+    border-radius: 999px; opacity: 0; transition: opacity .15s;
+    pointer-events: none; font-weight: 500;
+  }
+  .shotbox.focused .focusbadge { opacity: 1; }
+  .shotbox:not(.focused) .focusbadge.hint { opacity: 0.7; background: #666; }
+  .ripple {
+    position: absolute; width: 28px; height: 28px; margin: -14px 0 0 -14px;
+    border: 2px solid var(--accent); border-radius: 50%;
+    pointer-events: none; animation: ripple .5s ease-out forwards;
+  }
+  @keyframes ripple {
+    from { transform: scale(0.3); opacity: 1; }
+    to   { transform: scale(2.0); opacity: 0; }
+  }
+  /* Hidden input — OFF the screen area so iOS doesn't show paste/magnifier
+     menus over the screenshot. Still focusable so the soft keyboard appears. */
+  .kbd {
+    position: fixed; top: 0; left: 0;
+    width: 1px; height: 1px;
+    background: transparent; color: transparent; caret-color: transparent;
+    border: 0; padding: 0; margin: 0;
+    font-size: 16px;  /* 16px prevents iOS Safari from zooming on focus */
+    -webkit-appearance: none; appearance: none;
+    text-shadow: 0 0 0 transparent; outline: none;
+    opacity: 0;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;
+    pointer-events: none;  /* taps go to the image, not here */
+    z-index: 2;
+  }
+  .kbd:focus { outline: none; }
+  /* Block iOS image save / share menus on long-press, kill text selection */
+  .shot {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;  /* disable double-tap-zoom which delays clicks */
+  }
+  .shotbox {
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  .panel {
+    background: var(--panel); color: var(--panel-fg);
+    border: 1px solid var(--border); border-top: 0; border-radius: 0 0 10px 10px;
+    padding: 14px; box-shadow: var(--shadow);
+  }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .field label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; letter-spacing: .02em; }
+  .field input {
+    width: 100%; padding: 8px 10px; font: inherit; box-sizing: border-box;
+    background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 6px; outline: none;
+  }
+  .field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79,70,229,.15); }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  button {
+    background: var(--accent); color: white; border: 0;
+    padding: 9px 14px; border-radius: 6px; cursor: pointer; font: inherit; font-weight: 500;
+  }
+  button.sec { background: transparent; color: var(--fg); border: 1px solid var(--border); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status { font: 12px ui-monospace, monospace; color: var(--muted); min-height: 1.4em; padding-top: 6px; }
+  .quick {
+    display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px;
+  }
+  .quick a {
+    font-size: 12px; padding: 3px 8px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 999px;
+    color: var(--fg); text-decoration: none; cursor: pointer;
+  }
+  .quick a:hover { background: var(--accent); color: white; border-color: var(--accent); }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  details pre { background: var(--bg); padding: 8px; border-radius: 4px;
+    font-size: 11px; overflow-x: auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="dot" id="dot" title="connection status"></span>
+    <button class="navbtn" id="back"    title="Back"   >←</button>
+    <button class="navbtn" id="forward" title="Forward">→</button>
+    <button class="navbtn" id="reload"  title="Reload" >↻</button>
+    <form class="urlbar" id="urlbar" onsubmit="return false">
+      <input id="url" placeholder="https://…" spellcheck="false" autocapitalize="off" autocorrect="off">
+      <button id="go" type="submit">Go</button>
+    </form>
+  </header>
+  <div class="tabstrip" id="tabstrip"></div>
+
+  <div class="shotbox" id="shotbox" tabindex="0">
+    <img class="shot" id="shot" alt="live browser view" draggable="false">
+    <input class="kbd" id="kbd" type="text" inputmode="text"
+           autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+           aria-label="forwards typing to the remote browser">
+    <span class="focusbadge hint" id="focusbadge">tap to type</span>
+    <div class="loading" id="loading">loading screenshot…</div>
+  </div>
+
+  <div class="panel">
+    <div class="grid">
+      <div class="field">
+        <label for="email">Email / username</label>
+        <input id="email" type="email" autocomplete="username" placeholder="you@kth.se">
+      </div>
+      <div class="field">
+        <label for="pw">Password</label>
+        <input id="pw" type="password" autocomplete="current-password" placeholder="••••••••">
+      </div>
+    </div>
+
+    <div class="quick">
+      <a data-go="https://intra.kth.se">KTH intranet</a>
+      <a data-go="https://outlook.office.com">Outlook (KTH)</a>
+      <a data-go="https://www.kth.se">kth.se</a>
+      <a data-go="https://kth.app.box.com">KTH Box</a>
+      <a data-go="https://kthse.sharepoint.com">SharePoint</a>
+      <a data-go="https://github.com">GitHub</a>
+      <a data-go="https://google.com">Google</a>
+      <a data-go="https://chat.openai.com">ChatGPT</a>
+    </div>
+
+    <div class="row">
+      <button id="submit">Sign in →</button>
+      <button class="sec" id="fillEmail">Fill email only</button>
+      <button class="sec" id="fillPw">Fill password only</button>
+      <button class="sec" id="refresh">Refresh shot</button>
+      <button class="sec" id="showKbd" title="Force-focus the hidden input that captures typing">📱 Keyboard</button>
+      <a class="sec" id="openFull" href="/" target="_blank" rel="noopener" style="text-decoration:none; padding:9px 14px; border-radius:6px; border:1px solid var(--border); color:var(--fg)">Open in new tab ↗</a>
+    </div>
+
+    <div class="status" id="status">Ready.</div>
+
+    <details style="margin-top: 10px">
+      <summary>last action detail</summary>
+      <pre id="detail">{}</pre>
+    </details>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let lastStateOk = false;
+
+// No-flash refresh: preload the new image to memory, swap only after it's ready.
+// (Without this, mobile Safari shows a broken-image placeholder during the swap.)
+let _shotLoading = false;
+async function refreshShot() {
+  if (_shotLoading) return;
+  _shotLoading = true;
+  try {
+    const next = new Image();
+    next.crossOrigin = "anonymous";
+    next.decoding = "async";
+    next.onload = () => {
+      $("shot").src = next.src;
+      $("loading").style.display = "none";
+      _shotLoading = false;
+    };
+    next.onerror = () => { _shotLoading = false; };
+    next.src = "/screen.jpg?t=" + Date.now();
+  } catch (e) { _shotLoading = false; }
+}
+
+async function refreshState() {
+  try {
+    const r = await fetch("/state");
+    const s = await r.json();
+    if (s.error) throw new Error(s.error);
+    // Only update the address bar if the user isn't actively editing it.
+    const urlInput = $("url");
+    if (document.activeElement !== urlInput) {
+      urlInput.value = s.url || "";
+    }
+    urlInput.placeholder = "https://…";
+    $("dot").classList.toggle("ok", true);
+    $("dot").classList.toggle("bad", false);
+    $("dot").title = `${s.element_count} elements | service: ${s.service_id || '?'}`;
+    lastStateOk = true;
+  } catch (e) {
+    if (document.activeElement !== $("url")) $("url").value = "";
+    $("url").placeholder = "disconnected — " + e.message;
+    $("dot").classList.toggle("ok", false);
+    $("dot").classList.toggle("bad", true);
+    lastStateOk = false;
+  }
+}
+
+// Address bar navigation: Enter or Go button
+async function navigateFromUrlBar() {
+  let url = $("url").value.trim();
+  if (!url) return;
+  // Add https:// if scheme is missing
+  if (!/^[a-z]+:\/\//i.test(url)) {
+    // If it has a space or looks like a search, send to Google
+    if (/\s/.test(url) || !/\./.test(url)) {
+      url = "https://www.google.com/search?q=" + encodeURIComponent(url);
+    } else {
+      url = "https://" + url;
+    }
+  }
+  $("status").textContent = "Navigating to " + url + "…";
+  try {
+    const r = await post("/api/navigate", { url });
+    $("detail").textContent = JSON.stringify(r, null, 2);
+  } catch (e) { $("status").textContent = "nav err: " + e.message; }
+  $("url").blur();
+  setTimeout(refreshShot,  1000);
+  setTimeout(refreshState, 1300);
+  setTimeout(refreshShot,  2800);
+}
+$("go").addEventListener("click", (ev) => { ev.preventDefault(); navigateFromUrlBar(); });
+$("url").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") { ev.preventDefault(); navigateFromUrlBar(); }
+});
+
+async function post(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return r.json();
+}
+
+async function doFill({ withEmail, withPw, submit }) {
+  const btn = $("submit");
+  btn.disabled = true;
+  $("status").textContent = "Working…";
+  try {
+    const body = { submit: !!submit };
+    if (withEmail && $("email").value) body.email = $("email").value;
+    if (withPw    && $("pw").value)    body.password = $("pw").value;
+    const result = await post("/api/fill", body);
+    $("detail").textContent = JSON.stringify(result, null, 2);
+    if (result.error) {
+      $("status").textContent = "✗ " + result.error;
+    } else {
+      const ok = (result.actions || []).filter(a => a.ok).length;
+      $("status").textContent = `✓ ${ok} action${ok===1?"":"s"} completed`;
+      // clear password after successful submit
+      if (submit && withPw) $("pw").value = "";
+    }
+  } catch (e) {
+    $("status").textContent = "Error: " + e.message;
+  } finally {
+    btn.disabled = false;
+    setTimeout(refreshShot,  900);
+    setTimeout(refreshState, 1200);
+    setTimeout(refreshShot,  2200);
+  }
+}
+
+$("submit").onclick   = () => doFill({ withEmail: true,  withPw: true,  submit: true });
+$("fillEmail").onclick = () => doFill({ withEmail: true,  withPw: false, submit: true });
+$("fillPw").onclick    = () => doFill({ withEmail: false, withPw: true,  submit: true });
+$("refresh").onclick   = () => { refreshShot(); refreshState(); };
+// "📱 Keyboard": force-focus the hidden input so mobile soft-keyboard appears.
+// Must fire synchronously inside the click handler (no awaits before focus).
+$("showKbd").addEventListener("click", () => {
+  $("kbd").value = "";
+  $("kbd").focus({ preventScroll: true });
+  setFocus(true);
+});
+// "Open in new tab": work around iframe sandbox if popups blocked.
+$("openFull").addEventListener("click", (ev) => {
+  ev.preventDefault();
+  try { window.open(window.location.href, "_blank"); }
+  catch (e) {
+    $("status").textContent = "Open this URL manually: " + window.location.href;
+  }
+});
+
+document.querySelectorAll(".quick a[data-go]").forEach(a => {
+  a.onclick = async (ev) => {
+    ev.preventDefault();
+    $("status").textContent = "Navigating to " + a.dataset.go + "…";
+    const result = await post("/api/navigate", { url: a.dataset.go });
+    $("detail").textContent = JSON.stringify(result, null, 2);
+    setTimeout(refreshShot,  1200);
+    setTimeout(refreshState, 1500);
+    setTimeout(refreshShot,  3000);
+  };
+});
+
+// ─────── Browser toolbar ─────── //
+async function navAction(path, label) {
+  $("status").textContent = `→ ${label}…`;
+  try {
+    await post(path, {});
+  } catch(e) { $("status").textContent = `${label} err: ${e.message}`; }
+  setTimeout(refreshShot,  500);
+  setTimeout(refreshState, 700);
+  setTimeout(refreshShot,  1800);
+}
+$("back").onclick    = () => navAction("/api/back",    "back");
+$("forward").onclick = () => navAction("/api/forward", "forward");
+$("reload").onclick  = () => navAction("/api/reload",  "reload");
+
+// ─────── Tab strip ─────── //
+async function refreshTabs() {
+  try {
+    const tabs = await (await fetch("/api/tabs")).json();
+    const strip = $("tabstrip");
+    strip.innerHTML = "";
+    for (const t of tabs) {
+      const div = document.createElement("div");
+      div.className = "tab" + (t.active ? " active" : "");
+      div.title = t.url || "";
+      const ttl = document.createElement("span");
+      ttl.className = "ttl";
+      ttl.textContent = (t.title || t.url || "(blank)").slice(0, 40);
+      const x = document.createElement("span");
+      x.className = "x"; x.textContent = "×";
+      x.onclick = async (ev) => {
+        ev.stopPropagation();
+        await post("/api/close_tab", { tab_id: t.id });
+        setTimeout(refreshTabs, 250);
+        setTimeout(refreshShot, 350);
+      };
+      div.onclick = async () => {
+        await post("/api/activate_tab", { tab_id: t.id });
+        setTimeout(refreshTabs, 250);
+        setTimeout(refreshShot, 350);
+        setTimeout(refreshState, 400);
+      };
+      div.appendChild(ttl); div.appendChild(x);
+      strip.appendChild(div);
+    }
+    const newBtn = document.createElement("div");
+    newBtn.className = "newtab"; newBtn.textContent = "+";
+    newBtn.title = "New tab";
+    newBtn.onclick = async () => {
+      await post("/api/new_tab", { url: "about:blank" });
+      setTimeout(refreshTabs, 250);
+    };
+    strip.appendChild(newBtn);
+  } catch (e) { /* swallow */ }
+}
+setInterval(refreshTabs, 4000);
+refreshTabs();
+
+// ─────── Scroll: touch swipe + mouse wheel ─────── //
+let swipeStart = null;
+let lastSwipeWasMove = false;
+
+shot.addEventListener("touchstart", (e) => {
+  if (e.touches.length !== 1) return;
+  swipeStart = {
+    x: e.touches[0].clientX,
+    y: e.touches[0].clientY,
+    t: Date.now(),
+  };
+  lastSwipeWasMove = false;
+}, { passive: true });
+
+shot.addEventListener("touchmove", (e) => {
+  if (!swipeStart || e.touches.length !== 1) return;
+  const t = e.touches[0];
+  const dy = t.clientY - swipeStart.y;
+  const dx = t.clientX - swipeStart.x;
+  if (Math.abs(dy) > 10 || Math.abs(dx) > 10) {
+    lastSwipeWasMove = true;
+  }
+  // Don't prevent default here — allow native scroll if iframe wants it
+}, { passive: true });
+
+shot.addEventListener("touchend", (e) => {
+  if (!swipeStart) return;
+  const end = e.changedTouches[0];
+  const dx = end.clientX - swipeStart.x;
+  const dy = end.clientY - swipeStart.y;
+  const dist = Math.hypot(dx, dy);
+  const dt = Date.now() - swipeStart.t;
+  swipeStart = null;
+  if (dist > 18 && lastSwipeWasMove) {
+    // Swipe — scroll the page (inverted: swipe up = scroll down)
+    e.preventDefault();
+    const rect = shot.getBoundingClientRect();
+    const natH = shot.naturalHeight || 813;
+    const natW = shot.naturalWidth  || 1440;
+    // Add momentum factor if swipe was fast (<300ms)
+    const momentum = dt < 300 ? 2.2 : 1.4;
+    const scrollY = -Math.round(dy * (natH / rect.height) * momentum);
+    const scrollX = -Math.round(dx * (natW / rect.width)  * momentum);
+    post("/api/scroll_by", { dx: scrollX, dy: scrollY })
+      .then(() => { $("status").textContent = `scroll Δy=${scrollY}`; })
+      .catch((er) => { $("status").textContent = "scroll err: " + er.message; });
+    setTimeout(refreshShot, 300);
+    setTimeout(refreshShot, 800);
+    // Set flag so the following synthesized click is suppressed
+    lastSwipeWasMove = true;
+    return;
+  }
+  // Otherwise it was a tap — onShotTap (bound to click event) will fire next
+}, { passive: false });
+
+// Suppress click after a swipe gesture
+shot.addEventListener("click", (e) => {
+  if (lastSwipeWasMove) { lastSwipeWasMove = false; e.preventDefault(); e.stopPropagation(); }
+}, true);
+
+// Desktop mouse wheel scroll
+shot.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  post("/api/scroll_by", {
+    dx: Math.round(e.deltaX),
+    dy: Math.round(e.deltaY),
+  }).catch(() => {});
+  setTimeout(refreshShot, 250);
+}, { passive: false });
+
+// Allow Enter in password to submit
+$("pw").addEventListener("keydown", (ev) => { if (ev.key === "Enter") $("submit").click(); });
+
+// ─────────── Live click + type on the screenshot ─────────── //
+// The remote browser's CSS-pixel viewport size is the same as the screenshot's
+// natural pixel dimensions (Chrome --headless captures at CSS resolution with
+// DPR=1). So we just read shot.naturalWidth/Height after the image loads.
+
+function spawnRipple(parent, x, y) {
+  const r = document.createElement("div");
+  r.className = "ripple";
+  r.style.left = x + "px"; r.style.top = y + "px";
+  parent.appendChild(r);
+  setTimeout(() => r.remove(), 600);
+}
+
+const shotbox = $("shotbox");
+const shot    = $("shot");
+const kbd     = $("kbd");
+let shotFocused = false;
+function setFocus(v) {
+  shotFocused = v;
+  shotbox.classList.toggle("focused", v);
+  $("focusbadge").classList.toggle("hint", !v);
+  $("focusbadge").textContent = v ? "▶ live — typing forwarded" : "tap to type";
+}
+kbd.addEventListener("focus", () => setFocus(true));
+kbd.addEventListener("blur",  () => setFocus(false));
+
+// The hidden <input.kbd> is overlaid on top of the screenshot to receive
+// soft-keyboard input on mobile. Both `click` (desktop) and `touchend`
+// (mobile) fire here — we resolve the coordinates and forward.
+function shotXY(clientX, clientY) {
+  const rect = shot.getBoundingClientRect();
+  const px = clientX - rect.left, py = clientY - rect.top;
+  // Use the screenshot's actual natural dimensions for scaling — handles any
+  // viewport size without hardcoding. CSS pixels == native pixels here (DPR=1).
+  const natW = shot.naturalWidth  || 1440;
+  const natH = shot.naturalHeight || 813;
+  const x = Math.round(px * (natW / rect.width));
+  const y = Math.round(py * (natH / rect.height));
+  // Clamp to the image bounds (avoid clicks in any padding)
+  const cx = Math.max(0, Math.min(natW - 1, x));
+  const cy = Math.max(0, Math.min(natH - 1, y));
+  return { x: cx, y: cy, lx: px, ly: py, natW, natH };
+}
+
+// On every image load, sync the shotbox aspect-ratio to the natural size so
+// the .kbd overlay (inset:0) lines up exactly with what's visible.
+shot.addEventListener("load", () => {
+  if (shot.naturalWidth && shot.naturalHeight) {
+    shotbox.style.aspectRatio = `${shot.naturalWidth} / ${shot.naturalHeight}`;
+  }
+});
+
+async function doRemoteClick(clientX, clientY) {
+  const { x, y, lx, ly } = shotXY(clientX, clientY);
+  spawnRipple(shotbox, lx, ly);
+  // clear staged input so the next typing starts fresh
+  kbd.value = "";
+  // bring up the soft keyboard on mobile (must happen during user gesture)
+  kbd.focus({ preventScroll: true });
+  setFocus(true);
+  $("status").textContent = `→ click at (${x}, ${y})`;
+  try {
+    const r = await post("/api/click_at", { x, y });
+    $("detail").textContent = JSON.stringify(r, null, 2);
+    const info = r && (r.value || r);
+    if (info && info.tag)
+      $("status").textContent = `clicked: <${info.tag.toLowerCase()}> ${(info.text || "").trim()}`.slice(0, 110);
+  } catch (e) { $("status").textContent = "click err: " + e.message; }
+  setTimeout(refreshShot,   220);
+  setTimeout(refreshShot,   900);
+  setTimeout(refreshState, 1200);
+}
+
+// Tap handler bound to the SCREENSHOT (the image), not the kbd input.
+// On tap we synchronously focus the off-screen kbd input so the iOS keyboard
+// opens, then send the click coordinates to the remote browser.
+let lastTap = 0;
+function onShotTap(ev) {
+  const now = Date.now();
+  if (now - lastTap < 200) return;
+  lastTap = now;
+  let cx, cy;
+  if (ev.changedTouches && ev.changedTouches[0]) {
+    cx = ev.changedTouches[0].clientX;
+    cy = ev.changedTouches[0].clientY;
+  } else { cx = ev.clientX; cy = ev.clientY; }
+  if (ev.cancelable) ev.preventDefault();
+  // SYNCHRONOUS focus — must happen in the user gesture for iOS to open keyboard
+  kbd.value = "";
+  try { kbd.focus({ preventScroll: true }); } catch(e) { kbd.focus(); }
+  setFocus(true);
+  doRemoteClick(cx, cy);
+}
+// Bind on the IMAGE itself so iOS doesn't show paste menu over the screen.
+shot.addEventListener("click",    onShotTap);
+shot.addEventListener("touchend", onShotTap, { passive: false });
+// Also catch taps that hit the shotbox padding (rare with aspect-ratio set)
+shotbox.addEventListener("click",    (ev) => { if (ev.target === shotbox) onShotTap(ev); });
+shotbox.addEventListener("touchend", (ev) => { if (ev.target === shotbox) onShotTap(ev); }, { passive: false });
+
+// Forward keystrokes via TWO listeners:
+//   1) `input` event on the hidden kbd → captures both desktop and mobile typing.
+//      On mobile, native composition / autocorrect arrives as input events.
+//   2) `keydown` → captures special keys (Enter, Backspace, arrows) that don't
+//      come through `input` reliably on mobile.
+
+let typingTimer = null;
+function scheduleSendValue() {
+  if (typingTimer) clearTimeout(typingTimer);
+  typingTimer = setTimeout(async () => {
+    typingTimer = null;
+    const text = kbd.value;
+    if (!text) return;
+    kbd.value = "";  // reset for next batch
+    try {
+      await post("/api/paste", { text });
+      $("status").textContent = `typed "${text.length > 14 ? text.slice(0,14)+"…" : text}"`;
+    } catch(e) { $("status").textContent = "type err: " + e.message; }
+    setTimeout(refreshShot, 220);
+  }, 120);
+}
+
+kbd.addEventListener("input", (ev) => {
+  // For Backspace on iOS Safari this fires with inputType=deleteContentBackward.
+  if (ev.inputType === "deleteContentBackward" || ev.inputType === "deleteContentForward") {
+    // Forward as a Backspace/Delete keystroke on the remote.
+    const key = ev.inputType === "deleteContentForward" ? "Delete" : "Backspace";
+    kbd.value = "";  // these don't add to value anyway
+    post("/api/key", { key, modifiers: [] })
+      .then(() => { $("status").textContent = "→ " + key; })
+      .catch((e) => { $("status").textContent = "key err: " + e.message; });
+    setTimeout(refreshShot, 220);
+    return;
+  }
+  scheduleSendValue();
+});
+
+kbd.addEventListener("keydown", async (ev) => {
+  const special = ["Enter", "Tab", "Escape",
+                   "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+                   "Home", "End", "PageUp", "PageDown"];
+  const modifiers = [];
+  if (ev.ctrlKey)  modifiers.push("ctrl");
+  if (ev.shiftKey) modifiers.push("shift");
+  if (ev.altKey)   modifiers.push("alt");
+  if (ev.metaKey)  modifiers.push("meta");
+
+  // Backspace at start of empty input on iOS triggers keydown without input —
+  // also handle here.
+  if (ev.key === "Backspace") {
+    if (kbd.value === "") {
+      ev.preventDefault();
+      try {
+        await post("/api/key", { key: "Backspace", modifiers });
+        $("status").textContent = "→ Backspace";
+      } catch(e) {}
+      setTimeout(refreshShot, 220);
+    }
+    return;
+  }
+
+  // Special / modified keys: flush any pending typed text first, then send.
+  if (special.includes(ev.key) || (modifiers.some(m => m !== "shift") && ev.key.length === 1)) {
+    ev.preventDefault();
+    if (kbd.value) {
+      const text = kbd.value; kbd.value = "";
+      try { await post("/api/paste", { text }); } catch(e) {}
+    }
+    try {
+      await post("/api/key", { key: ev.key, modifiers });
+      $("status").textContent = `→ ${ev.key}` + (modifiers.length ? " (" + modifiers.join("+") + ")" : "");
+    } catch(e) { $("status").textContent = "key err: " + e.message; }
+    setTimeout(refreshShot, 220);
+    setTimeout(refreshShot, 900);
+  }
+});
+
+// Polling
+refreshShot(); refreshState();
+setInterval(refreshShot, 1500);
+setInterval(refreshState, 3500);
+</script>
+</body>
+</html>

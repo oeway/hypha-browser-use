@@ -15,6 +15,9 @@ extension/lib/hypha-rpc.mjs.orig
 .headless-test.log
 .extension.id
 .hypha-browser-use/
+.browser-share.pid
+.browser-share.log
+outputs/kth-*.png
 
 node_modules/
 *.crx

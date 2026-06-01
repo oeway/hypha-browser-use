@@ -412,6 +412,149 @@ async function wait_for_selector({ selector, timeout_ms = 10000, visible = true,
   return { ok: false, error: "timeout", elapsed_ms: Date.now() - t0 };
 }
 
+// ── viewport-coordinate click (CSP-safe — bypasses eval_js)
+async function click_at({ x, y, tab_id = null, mark = true }) {
+  const id = await resolveTabId(tab_id);
+  return await pageEval(id, (cx, cy, doMark) => {
+    if (doMark) {
+      try {
+        const dot = document.createElement("div");
+        dot.style.cssText = "position:fixed;left:"+(cx-10)+"px;top:"+(cy-10)+"px;"+
+          "width:20px;height:20px;border-radius:50%;border:3px solid #ff3b30;"+
+          "background:rgba(255,59,48,.4);pointer-events:none;z-index:2147483647;"+
+          "box-shadow:0 0 0 2px rgba(255,255,255,.9);transition:opacity .8s ease 0.3s;";
+        document.documentElement.appendChild(dot);
+        setTimeout(() => { dot.style.opacity = "0"; }, 200);
+        setTimeout(() => dot.remove(), 1500);
+      } catch (_) {}
+    }
+    const el = document.elementFromPoint(cx, cy);
+    if (!el) return { ok: false, error: "no element at point (" + cx + "," + cy + ")",
+                      viewport: [innerWidth, innerHeight] };
+    const opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, button: 0, view: window };
+    el.dispatchEvent(new MouseEvent("mousemove", opts));
+    el.dispatchEvent(new MouseEvent("mouseover", opts));
+    el.dispatchEvent(new MouseEvent("mousedown", opts));
+    if (typeof el.focus === "function") {
+      try { el.focus({ preventScroll: false }); } catch (_) { el.focus(); }
+    }
+    el.dispatchEvent(new MouseEvent("mouseup", opts));
+    el.click();
+    const r = el.getBoundingClientRect();
+    return {
+      ok: true, tag: el.tagName,
+      role: (el.getAttribute && el.getAttribute("role")) || null,
+      href: el.href || null,
+      text: (el.innerText || el.textContent || "").trim().slice(0, 80),
+      click: [cx, cy],
+      element_bounds: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
+      viewport: [innerWidth, innerHeight],
+    };
+  }, [x, y, mark]);
+}
+
+// ── scroll the page by an exact pixel delta (CSP-safe)
+async function scroll_by({ dx = 0, dy = 0, tab_id = null }) {
+  const id = await resolveTabId(tab_id);
+  return await pageEval(id, (x, y) => {
+    window.scrollBy({ left: x, top: y, behavior: "auto" });
+    return {
+      ok: true,
+      scroll: [window.scrollX, window.scrollY],
+      max:    [document.documentElement.scrollWidth - innerWidth,
+               document.documentElement.scrollHeight - innerHeight],
+      viewport: [innerWidth, innerHeight],
+    };
+  }, [dx, dy]);
+}
+
+// ── scroll absolute position
+async function scroll_to_position({ x = null, y = null, tab_id = null }) {
+  const id = await resolveTabId(tab_id);
+  return await pageEval(id, (px, py) => {
+    const tx = px == null ? window.scrollX : px;
+    const ty = py == null ? window.scrollY : py;
+    window.scrollTo({ left: tx, top: ty, behavior: "auto" });
+    return { ok: true, scroll: [window.scrollX, window.scrollY] };
+  }, [x, y]);
+}
+
+// ── insert text at the currently focused element (CSP-safe)
+async function paste_text({ text, tab_id = null }) {
+  const id = await resolveTabId(tab_id);
+  return await pageEval(id, (t) => {
+    const el = document.activeElement;
+    if (!el) return { ok: false, error: "no active element" };
+    if (el.isContentEditable) {
+      try { document.execCommand && document.execCommand("insertText", false, t); }
+      catch (_) {}
+      return { ok: true, mode: "contenteditable", length: t.length };
+    }
+    if (el.tagName !== "INPUT" && el.tagName !== "TEXTAREA") {
+      return { ok: false, error: "focused not editable: " + el.tagName };
+    }
+    const setter =
+      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set ||
+      Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+    const cur = el.value || "";
+    const start = el.selectionStart != null ? el.selectionStart : cur.length;
+    const end   = el.selectionEnd   != null ? el.selectionEnd   : cur.length;
+    const next = cur.slice(0, start) + t + cur.slice(end);
+    if (setter) setter.call(el, next); else el.value = next;
+    try { el.setSelectionRange(start + t.length, start + t.length); } catch (_) {}
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return { ok: true, tag: el.tagName, length: el.value.length };
+  }, [text]);
+}
+
+// ── press a single key (CSP-safe) — extends `press_key` to mutate the value
+//    for Backspace/Delete/Enter on inputs so it actually takes visible effect.
+async function press_key_v2({ key, modifiers = [], tab_id = null, selector = null }) {
+  const id = await resolveTabId(tab_id);
+  return await pageEval(id, (k, mods, sel) => {
+    const el = sel ? document.querySelector(sel) : (document.activeElement || document.body);
+    if (!el) return { ok: false, error: "no target" };
+    const opts = {
+      key: k, bubbles: true, cancelable: true,
+      ctrlKey:  mods.indexOf("ctrl")  >= 0,
+      shiftKey: mods.indexOf("shift") >= 0,
+      altKey:   mods.indexOf("alt")   >= 0,
+      metaKey:  mods.indexOf("meta")  >= 0,
+    };
+    el.dispatchEvent(new KeyboardEvent("keydown", opts));
+    const isInput = el.tagName === "INPUT" || el.tagName === "TEXTAREA";
+    if (k === "Backspace" && isInput) {
+      const start = el.selectionStart != null ? el.selectionStart : el.value.length;
+      const end   = el.selectionEnd   != null ? el.selectionEnd   : start;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set
+                  || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+      const cs = start === end ? Math.max(0, start - 1) : start;
+      const next = el.value.slice(0, cs) + el.value.slice(end);
+      if (setter) setter.call(el, next); else el.value = next;
+      try { el.setSelectionRange(cs, cs); } catch (_) {}
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    } else if (k === "Delete" && isInput) {
+      const start = el.selectionStart != null ? el.selectionStart : 0;
+      const end   = el.selectionEnd   != null ? el.selectionEnd   : start;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set
+                  || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+      const ce = start === end ? Math.min(el.value.length, end + 1) : end;
+      const next = el.value.slice(0, start) + el.value.slice(ce);
+      if (setter) setter.call(el, next); else el.value = next;
+      try { el.setSelectionRange(start, start); } catch (_) {}
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    } else if (k === "Enter" && el.tagName === "INPUT") {
+      // Trigger form submit if applicable
+      if (el.form && el.form.requestSubmit) {
+        try { el.form.requestSubmit(); } catch (_) { try { el.form.submit(); } catch (_) {} }
+      }
+    }
+    el.dispatchEvent(new KeyboardEvent("keyup", opts));
+    return { ok: true, key: k, tag: el.tagName };
+  }, [key, modifiers, selector]);
+}
+
 // ── arbitrary JS
 async function eval_js({ code, tab_id = null, world = "MAIN" }) {
   const id = await resolveTabId(tab_id);
@@ -622,6 +765,7 @@ const TOOL_TABLE = {
   query, click, fill, select_option, scroll, scroll_to,
   focus_element, press_key, read_text, read_attribute, wait_for_selector,
   eval_js,
+  click_at, paste_text, press_key_v2, scroll_by, scroll_to_position,
   get_browser_state, click_by_index, input_by_index,
   get_cookies, set_cookie, delete_cookie,
   download, list_downloads, wait_for_download,
