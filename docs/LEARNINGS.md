@@ -218,8 +218,309 @@ If you want to lift any of this for your own project:
 
 ## 14. Things to verify next
 
-- [ ] Network navigation works when the Mac mini has an active GUI session (display attached).
-- [ ] `Extensions.loadUnpacked` + `--headless=new` together (untested combination).
+- [ ] Network navigation works when the Mac mini has an active GUI session (display attached). — **CONFIRMED OK with `--headless=new`**: extension loads, full page rendering works, screenshots come through at 1440×813.
+- [x] `Extensions.loadUnpacked` + `--headless=new` together. **Verified working** — adds `--headless=new --window-size=1440,900` to the existing pipe + unsafe-extension-debugging combo. No display needed.
 - [ ] LaunchAgent plist for auto-start on reboot.
 - [ ] The duplicate SW connection on startup (harmless but cosmetic — two services register).
 - [ ] Behavior across Chrome major-version upgrades (148 → 149 → ...).
+
+---
+
+# Part 2: Real-world login flows (KTH ADFS, MS 365, banks) — learnings
+
+Added 2026-05-29 after building the embedded login panel + orchestrator.
+
+## 15. Many enterprise login flows are multi-page
+
+The flow is rarely "fill email + password + submit". You'll see:
+
+```
+Page 1 (login.microsoftonline.com)        — email only ("Enter email")
+   → submit → routes to your tenant
+Page 2 (login.ug.kth.se/adfs/...)         — password only,
+                                            but with a HIDDEN username
+                                            field that ALSO must be filled
+   → submit → ADFS validates both
+Page 3 (back on login.microsoftonline.com) — 2FA number-match prompt:
+                                            "Approve sign-in with 27"
+   → user taps "27" on their phone
+   → page advances on its own
+Page 4 (target — Outlook, SharePoint, etc.) — logged in
+```
+
+A single-shot "fill both fields and click submit" fails on step 2 because the email field doesn't exist on the password page — and the password page has a HIDDEN username field that must also be filled.
+
+**The orchestrator pattern:**
+
+```python
+async def login_step():
+    state = await get_browser_state()
+    if has_2fa_digit_visible(state):  return "show number to user"
+    if has_password_field(state):     fill_username_AND_password(); submit()
+    if has_email_field(state):        fill_email(); submit()
+    if past_login_host(state):        return "complete"
+```
+
+Client polls in a loop. Each call advances one step.
+
+## 16. ADFS-style pages have a hidden username field on step 2
+
+KTH (login.ug.kth.se) reuses ONE template for both username and password steps:
+
+```html
+<form id="loginForm">
+  <input id="userNameInput" name="UserName" type="email" ...>    <!-- step 1: visible. step 2: display:none -->
+  <input id="passwordInput" name="Password" type="password" ...> <!-- step 1: not in DOM. step 2: visible -->
+  <span id="nextButton"   ...>Next</span>                        <!-- step 1 only -->
+  <span id="submitButton" ...>Sign in</span>                     <!-- step 2 only -->
+</form>
+```
+
+On step 2, the username container is `display:none` but the **input still exists in the DOM and is required by the submit handler**:
+
+```js
+function submitLoginRequest() {                          // wired to span#submitButton.onclick
+    var userName = document.getElementById('userNameInput');
+    if (!userName.value || !userName.value.match('[@\\\\]')) {
+        u.setError(userName, e.userNameFormatError);    // ← "Enter your user ID in the format 'domain\user' or 'user@domain'"
+        return false;
+    }
+    ...
+    document.forms['loginForm'].submit();
+}
+```
+
+If the hidden username is empty when this runs, the error displays — which from the user's POV looks like a "format error" but is actually "field is empty".
+
+**Fix:** the orchestrator must fill the hidden username via CSS selector (`#userNameInput`, `input[name=UserName|loginfmt|Username]`) on the password step, BEFORE clicking submit.
+
+## 17. `get_browser_state` was silently skipping hidden form fields
+
+The original extension code:
+
+```js
+const isVisible = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    ...
+};
+if (!isVisible(el)) continue;
+```
+
+This skipped any element with zero bounding rect — including KTH ADFS's hidden username input. The orchestrator never even saw the field existed.
+
+**Fix:** keep form-fillable inputs (type=text/email/password/tel/number/search/url, plus `<textarea>` and `<select>`) even when CSS-hidden. Non-form invisible elements are still excluded.
+
+```js
+const isFormFillable = (el) => {
+    const tag = el.tagName;
+    if (tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (tag !== "INPUT") return false;
+    const t = (el.type || "").toLowerCase();
+    return ["text","email","password","tel","number","search","url",""].includes(t);
+};
+const isVisible = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return isFormFillable(el);
+    const cs = getComputedStyle(el);
+    if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) === 0)
+        return isFormFillable(el);
+    return true;
+};
+```
+
+## 18. `Element.getAttribute('value')` and `Element.value` are different
+
+The DOM `.value` property is what the form actually posts; the HTML `value` attribute reflects only the initial markup or values set via `setAttribute()`.
+
+So tools that "verify a field is filled" using `read_attribute`/`getAttribute('value')` will return empty even when the field was successfully filled via the React-friendly setter — because the setter sets the DOM property only.
+
+**Always check via `.value`** when verifying field state. Either through `eval_js`:
+
+```js
+document.querySelector('#userNameInput').value
+```
+
+or via a tool that explicitly reads `.value`:
+
+```js
+return await pageEval(id, (sel) => document.querySelector(sel)?.value, [selector]);
+```
+
+## 19. Multiple separate chrome.scripting.executeScript calls can lose state
+
+Each tool call (e.g., `fill`, `click_by_index`, `input_by_index`, `click_by_index`) is a separate `chrome.scripting.executeScript({func, args})` invocation. Each runs in its own micro-task and returns. The page can re-render between them.
+
+Specifically observed on KTH ADFS combined-page:
+1. POST `/fill #userNameInput → "user@domain"` → DOM `.value` set, dispatch input/change → ok
+2. (Chrome scripting context disposes, page processes events, possibly re-renders) ← 100-200ms gap
+3. POST `/fill #passwordInput → "..."` → DOM `.value` for password set, but **username has been reset by the page's own state-rehydration code**
+4. POST `/click_by_index` on submit → page's `Login.submitLoginRequest()` runs → reads `userName.value` → empty → shows format error
+
+**Fix:** when filling a form whose submit handler reads multiple field values, do username + password + submit in **one atomic `eval_js`** so the page can't dispose state between operations:
+
+```js
+// One eval_js call that does ALL of it:
+(() => {
+  const userField = document.querySelector('#userNameInput, input[name=UserName]');
+  const pwField   = document.querySelector('input[type=password]');
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+  setter.call(userField, EMAIL);
+  userField.setAttribute('value', EMAIL);          // belt-and-suspenders
+  userField.dispatchEvent(new Event('input', {bubbles:true}));
+  userField.dispatchEvent(new Event('change', {bubbles:true}));
+  setter.call(pwField, PASSWORD);
+  pwField.dispatchEvent(new Event('input', {bubbles:true}));
+  pwField.dispatchEvent(new Event('change', {bubbles:true}));
+  if (window.Login && window.Login.submitLoginRequest)  // prefer page's own submit
+    return window.Login.submitLoginRequest();
+  document.querySelector('#submitButton').click();
+})()
+```
+
+This costs one round-trip and the page sees a complete, consistent form state at submit time.
+
+## 20. Prefer the page's OWN submit function over `button.click()`
+
+ADFS's submit button is `<span id="submitButton" onclick="return Login.submitLoginRequest();">`. Simulating `.click()` on the span SHOULD work, but:
+
+- The span has CSS that's not a real button — some pages set `pointer-events: none` based on validation state
+- Calling `submitButton.click()` runs onclick, which calls `Login.submitLoginRequest()` — but if our synthetic click event doesn't propagate exactly like a user one, the onclick might not fire
+- Direct `Login.submitLoginRequest()` invocation is faster and runs the exact same validation the user gets
+
+When the page exposes a global submit function (`Login.submitLoginRequest`, `App.signIn`, etc.), call it directly:
+
+```js
+if (window.Login?.submitLoginRequest) return window.Login.submitLoginRequest();
+```
+
+Fall back to `button.click()` only if no such function exists.
+
+## 21. 2FA number-match detection heuristic
+
+The MS Authenticator number-match prompt renders the 2-digit number in a big element. The exact selector varies (`#idRichContext_DisplaySign`, `.display-sign-in-number`, no class at all). A robust detector:
+
+```python
+def detect_2fa_number(elements):
+    candidates = []
+    for e in elements:
+        text = (e.get("text") or "").strip()
+        if not (text.isdigit() and 1 <= len(text) <= 3): continue
+        bbox = e.get("bbox") or {}
+        w, h = bbox.get("w", 0), bbox.get("h", 0)
+        if w < 20 or h < 20: continue
+        # Prefer elements with hinting attributes
+        attrs = e.get("attrs", {})
+        cls_id = (attrs.get("id","") + " " + attrs.get("class","")).lower()
+        score = w * h
+        if "sign" in cls_id: score *= 10
+        if attrs.get("aria-live"): score *= 5
+        candidates.append((score, text, e))
+    return candidates[0][1] if (candidates := sorted(candidates, reverse=True)) else None
+```
+
+Combined with URL check (`microsoftonline.com` in URL, or "approve" in title), this catches the prompt reliably without false positives from "2" appearing in dates or counters.
+
+When detected, the orchestrator should:
+1. Return the number to the client
+2. Client shows a big overlay with the number
+3. Fire a native notification (`chrome.notifications` or `osascript -e 'display notification'`)
+4. Continue polling — the page advances on its own when the user taps approve on their phone
+
+## 22. Mobile-specific browser-control gotchas (iPad / Safari iOS)
+
+Discovered while building the embeddable login panel.
+
+| Issue | Cause | Fix |
+|---|---|---|
+| Soft keyboard doesn't appear when tapping the screenshot | `focus()` only triggers keyboard if called **synchronously** inside the user-gesture event handler | Call `kbd.focus()` directly in the touch handler, BEFORE any `await` |
+| iOS shows "Paste / Look up" menu on screenshot tap | `<img>` long-press triggers context menu | `-webkit-touch-callout: none; -webkit-user-select: none;` on the img |
+| Tap gestures suppressed as "swipe" | Setting a swipe flag on any touchmove with >10px drift | Only set the flag in touchend when distance >25px; clear after 200ms |
+| Coordinates misaligned | Hardcoded `VIEW = 1440 × 900` doesn't match actual viewport (1440 × 813 with Chrome chrome) | Use `shot.naturalWidth` / `naturalHeight` — adapts automatically |
+| Screen flashes "broken image ?" between refreshes | Setting `<img>.src` unloads the current image during fetch | Preload the new image to memory (`new Image()`), swap `<img>.src` only after `onload` fires |
+| iOS auto-zooms when focusing input | Default font-size < 16px triggers Safari's "smart" zoom | `font-size: 16px` on the focusable input |
+| Keyboard returns from event but value is wrong | `keydown` on mobile doesn't fire for every char (composition / autocorrect) | Listen to `input` events on the hidden field, not just `keydown`. Backspace fires `inputType: deleteContentBackward` |
+
+The hidden-input technique for mobile keyboards:
+
+```html
+<div class="shotbox">
+  <img id="shot" src="/screen.jpg">
+  <input class="kbd" id="kbd" type="text" inputmode="text"
+         autocomplete="off" autocorrect="off" autocapitalize="off"
+         spellcheck="false">  <!-- overlaid; transparent text + caret -->
+</div>
+```
+
+```css
+.kbd {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  background: transparent; color: transparent; caret-color: transparent;
+  font-size: 16px;  /* prevent iOS zoom */
+  -webkit-appearance: none;
+}
+```
+
+```js
+// Tapping the shot synchronously focuses the kbd — keyboard appears.
+shot.addEventListener('touchend', (e) => {
+    // ... compute coordinates, forward click ...
+    kbd.value = '';
+    kbd.focus({ preventScroll: true });   // ← MUST be synchronous, in this handler
+});
+// Keystrokes captured via input event, batched + sent to remote.
+kbd.addEventListener('input', () => {
+    const text = kbd.value; kbd.value = '';
+    if (text) post('/api/paste', { text });
+});
+```
+
+## 23. iframe sandbox + CORS
+
+When embedded in an iframe sandbox (Svamp artifact, etc.), the iframe has `null` origin. `fetch('/state')` to the same hostname is treated as cross-origin → CORS rules apply.
+
+Without CORS headers, `Failed to fetch` appears with no other clue (no preflight 403, just an inability to load).
+
+```python
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # acceptable since the unguessable tunnel hostname
+    allow_methods=["*"],   # already gates access
+    allow_headers=["*"],
+    allow_credentials=False,
+)
+```
+
+## 24. Tunnel URLs are stable but the tunnel can briefly 404 during restart
+
+`svamp service expose` keeps the same URL prefix across restarts (it hashes the service name into the subdomain), but the actual frpc forwarder briefly disconnects when the local process restarts. During that window (~2s), requests get an `frp` 404 page.
+
+**Implication for embedded iframes:** the artifact may show "page not found" right after a server restart. The fix is to wait 2-3 seconds and refresh. Don't change the embed URL.
+
+## 25. Architectural shape, take 2
+
+After the panel work, the full stack is:
+
+```
+   YOU (browser in chat panel or new tab)
+   ──────────────────────────────────────
+              │ HTTPS + CORS
+              ▼
+   browser-share FastAPI  (login UI + click_at/paste_text passthrough +
+                           multi-step login_step orchestrator)
+              │ kwargs-wrapped JSON over Hypha RPC
+              ▼
+   Hypha cloud relay
+              │ HTTP-streaming transport
+              ▼
+   MV3 service worker  (40+ CSP-safe tools)
+              │ chrome.* API
+              ▼
+   Real Chrome stable on the Mac mini
+              │
+              └─ same Chrome session continues to be driven by the agent
+                 once you close the panel (cookies persist in profile)
+```
+
+The panel handles the parts that NEED a human (passwords, biometric 2FA, CAPTCHAs, first-login per site). The agent handles everything else autonomously, using the same Chrome session.

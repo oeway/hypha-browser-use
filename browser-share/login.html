@@ -185,6 +185,24 @@
     color: var(--fg); text-decoration: none; cursor: pointer;
   }
   .quick a:hover { background: var(--accent); color: white; border-color: var(--accent); }
+  .saved { display: flex; flex-direction: column; gap: 6px; }
+  .saved .row {
+    display: flex; align-items: center; gap: 6px; margin: 0; padding: 8px 12px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  }
+  .saved .row .lab { flex: 1; font-size: 13px; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .saved .row .lab .acct { font-weight: 500; }
+  .saved .row .lab .site { color: var(--muted); font-size: 11px; margin-left: 4px; }
+  .saved .row .use {
+    background: var(--accent); color: white; border: 0; padding: 5px 12px;
+    border-radius: 4px; font-size: 12px; cursor: pointer; font-weight: 500;
+  }
+  .saved .row .del {
+    background: transparent; color: var(--muted); border: 1px solid var(--border);
+    padding: 5px 10px; border-radius: 4px; font-size: 11px; cursor: pointer;
+  }
+  .saved .empty { color: var(--muted); font-size: 12px; text-align: center; padding: 4px; }
   details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
   details pre { background: var(--bg); padding: 8px; border-radius: 4px;
     font-size: 11px; overflow-x: auto; }
@@ -221,6 +239,9 @@
   </div>
 
   <div class="panel">
+    <!-- Saved logins (from macOS Keychain) — one-tap sign-in -->
+    <div id="savedLogins" class="saved" style="margin-bottom: 10px"></div>
+
     <div class="grid">
       <div class="field">
         <label for="email">Email / username</label>
@@ -230,6 +251,12 @@
         <label for="pw">Password</label>
         <input id="pw" type="password" autocomplete="current-password" placeholder="••••••••">
       </div>
+    </div>
+    <div class="row" style="margin-top: 6px">
+      <label style="font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 5px; cursor: pointer">
+        <input type="checkbox" id="saveCreds" style="width: auto; margin: 0">
+        Save credentials to macOS Keychain for one-tap sign-in next time
+      </label>
     </div>
 
     <div class="quick">
@@ -453,6 +480,131 @@ $("submit").onclick    = () => runLoginFlow();
 $("fillEmail").onclick = () => doFill({ withEmail: true,  withPw: false, submit: true });
 $("fillPw").onclick    = () => doFill({ withEmail: false, withPw: true,  submit: true });
 $("twofaClose").onclick = () => $("twofa").classList.remove("show");
+
+// ───── Saved credentials (macOS Keychain) ───── //
+let savedCache = { items: [], suggested_site: "" };
+
+async function refreshSaved() {
+  try {
+    const r = await fetch("/api/credentials");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    savedCache = await r.json();
+  } catch (e) {
+    savedCache = { items: [], suggested_site: "" };
+  }
+  renderSaved();
+}
+
+function renderSaved() {
+  const el = $("savedLogins");
+  const items = savedCache.items || [];
+  if (!items.length) {
+    el.innerHTML = `<div class="empty">No saved logins yet — sign in below with “Save credentials” checked to add one.</div>`;
+    return;
+  }
+  el.innerHTML = "";
+  for (const it of items) {
+    const row = document.createElement("div"); row.className = "row";
+    row.innerHTML = `
+      <div class="lab"><span class="acct">${it.account}</span><span class="site">@ ${it.site}</span></div>
+      <button class="use" data-site="${it.site}" data-acct="${it.account}">Sign in →</button>
+      <button class="del" data-site="${it.site}" data-acct="${it.account}">×</button>
+    `;
+    row.querySelector(".use").onclick = () => runLoginFlow({ savedSite: it.site, savedAccount: it.account });
+    row.querySelector(".del").onclick = async () => {
+      if (!confirm(`Delete saved login for ${it.account} @ ${it.site}?`)) return;
+      await post("/api/credentials/delete", { site: it.site, account: it.account });
+      refreshSaved();
+    };
+    el.appendChild(row);
+  }
+}
+
+// Override runLoginFlow to optionally use saved credentials + save on success
+const _origRunLoginFlow = runLoginFlow;
+runLoginFlow = async function(opts = {}) {
+  if (loginRunning) { $("status").textContent = "(login already running)"; return; }
+  const usingSaved = !!opts.savedSite;
+  const email = usingSaved ? opts.savedAccount : $("email").value.trim();
+  const password_input = $("pw").value;
+  if (!usingSaved && !email && !password_input) {
+    $("status").textContent = "Type email and/or password first, or use a saved login.";
+    return;
+  }
+  loginRunning = true;
+  $("submit").disabled = true;
+  $("status").textContent = usingSaved ? `Starting saved login for ${email}…` : "Starting login flow…";
+  $("twofa").classList.remove("show");
+
+  const start = Date.now();
+  let lastStep = "", sameStepCount = 0, twofaShown = false;
+  let completedOk = false;
+  try {
+    while (Date.now() - start < 180_000) {
+      let r;
+      try {
+        // Use saved-credential endpoint when running from a saved entry; otherwise
+        // pass the manually-typed form values.
+        if (usingSaved) {
+          r = await post("/api/login_step_saved", { site: opts.savedSite, account: opts.savedAccount });
+        } else {
+          r = await post("/api/login_step", { email, password: password_input });
+        }
+      } catch (e) { $("status").textContent = "step err: " + e.message; break; }
+      $("detail").textContent = JSON.stringify(r, null, 2);
+
+      const step = r.step || "?";
+      $("status").textContent = `[${step}] ${r.message || ""}`;
+      sameStepCount = (step === lastStep) ? sameStepCount + 1 : 0;
+      lastStep = step;
+      refreshShot(); refreshState();
+
+      if (step === "complete") {
+        $("status").textContent = "✓ Logged in — " + (r.title || r.url || "");
+        $("twofa").classList.remove("show");
+        completedOk = true;
+        break;
+      }
+      if (step === "error") { $("status").textContent = "✗ " + (r.error || r.message); break; }
+      if (step === "2fa_waiting") {
+        if (!twofaShown) {
+          $("twofaNum").textContent = r.number || "?";
+          $("twofa").classList.add("show");
+          twofaShown = true;
+          post("/api/notify", { message: "Approve sign-in with " + r.number, level: "info" }).catch(()=>{});
+        }
+        await sleep(2500);
+        continue;
+      }
+      if (step === "email_needed" && !email) { $("status").textContent = "Email required"; break; }
+      if (step === "password_needed" && !usingSaved && !password_input) { $("status").textContent = "Password required"; break; }
+      if (step === "no_page") { $("status").textContent = r.message; break; }
+      if (sameStepCount > 6) { $("status").textContent = `Stuck at ${step} — check the screen.`; break; }
+      await sleep(step.endsWith("submitted") ? 1800 : 900);
+    }
+
+    // On successful manual login, optionally save to Keychain.
+    if (completedOk && !usingSaved && $("saveCreds").checked && email && password_input) {
+      try {
+        const saveRes = await post("/api/credentials/save", { account: email, password: password_input });
+        if (saveRes.ok) {
+          $("status").textContent += `  ·  saved to Keychain (${saveRes.site})`;
+          $("pw").value = "";
+          $("saveCreds").checked = false;
+          refreshSaved();
+        }
+      } catch (e) { /* non-fatal */ }
+    } else if (completedOk) {
+      $("pw").value = "";  // clear typed password regardless
+    }
+  } finally {
+    loginRunning = false;
+    $("submit").disabled = false;
+  }
+};
+
+refreshSaved();
+setInterval(refreshSaved, 30000);
 $("refresh").onclick   = () => { refreshShot(); refreshState(); };
 // "📱 Keyboard": force-focus the hidden input so mobile soft-keyboard appears.
 // Must fire synchronously inside the click handler (no awaits before focus).

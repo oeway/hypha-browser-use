@@ -10,9 +10,10 @@ Run:
   uv run --with fastapi --with uvicorn --with httpx python3 server.py
 """
 from __future__ import annotations
-import os, base64, urllib.parse, asyncio, time, json
+import os, base64, urllib.parse, asyncio, time, json, subprocess
 from pathlib import Path
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse as _urlparse
 
 import httpx
 from fastapi import FastAPI, Request
@@ -480,6 +481,202 @@ async def api_notify(req: Request):
             "level":   body.get("level", "info"),
         })
     except Exception as e: return JSONResponse({"error": str(e)}, status_code=500)
+
+# ───────── macOS Keychain credential storage ───────── #
+# We use a DEDICATED app keychain at ~/Library/Keychains/hypha-browser.keychain-db
+# with an empty password and auto-unlock. This avoids the GUI authorization
+# prompt that the login keychain requires for writes from a headless/SSH session.
+# Items use:
+#   - Internet password: service="hypha-browser:<site>", account=<email>
+#   - A generic-password JSON index for fast listing.
+KC_NAME = "hypha-browser.keychain"
+KC_PATH = str(Path.home() / "Library" / "Keychains" / "hypha-browser.keychain-db")
+KC_SERVICE_PREFIX = "hypha-browser:"
+KC_INDEX_SERVICE = "hypha-browser:_index"
+KC_INDEX_ACCOUNT = "index"
+
+def _kc_service_for(site: str) -> str:
+    return f"{KC_SERVICE_PREFIX}{site}"
+
+def _kc_ensure_exists() -> str:
+    """Create the dedicated keychain if missing; unlock + persist."""
+    # security looks up by name OR by full path. Prefer path to avoid
+    # ambiguity with a same-named keychain elsewhere.
+    target = KC_PATH if os.path.exists(KC_PATH) else KC_NAME
+    if not os.path.exists(KC_PATH):
+        subprocess.run(
+            ["/usr/bin/security", "create-keychain", "-p", "", KC_PATH],
+            check=True, timeout=5, capture_output=True, text=True)
+        # Settings: no auto-lock, no timeout
+        subprocess.run(
+            ["/usr/bin/security", "set-keychain-settings", "-lut", "0", KC_PATH],
+            check=False, timeout=5, capture_output=True)
+        # Make sure the keychain is in the user's search list so it can be
+        # discovered by `find-internet-password` without explicit -k path.
+        try:
+            cur = subprocess.run(
+                ["/usr/bin/security", "list-keychains", "-d", "user"],
+                capture_output=True, text=True, timeout=5)
+            existing = [x.strip().strip('"') for x in cur.stdout.splitlines() if x.strip()]
+            if KC_PATH not in existing:
+                subprocess.run(
+                    ["/usr/bin/security", "list-keychains", "-d", "user",
+                     "-s", KC_PATH, *existing],
+                    check=False, timeout=5, capture_output=True)
+        except Exception: pass
+    # Always unlock (empty password) before any operation
+    subprocess.run(
+        ["/usr/bin/security", "unlock-keychain", "-p", "", KC_PATH],
+        check=False, timeout=5, capture_output=True)
+    return KC_PATH
+
+def _site_from_url(url: str) -> str:
+    """Extract a stable 'site' key from a URL — eTLD+1 by default.
+    e.g. 'https://login.ug.kth.se/adfs/...' → 'kth.se'
+         'https://outlook.office.com/mail' → 'office.com'
+    """
+    try:
+        host = (_urlparse(url).hostname or "").lower()
+        if not host: return ""
+        parts = host.split(".")
+        # multi-part TLDs (co.uk, com.au, etc.) — keep last 3 if penultimate ≤ 3 chars
+        if len(parts) >= 3 and len(parts[-2]) <= 3 and parts[-2] in ("co","com","ac","gov","org","net","edu"):
+            return ".".join(parts[-3:])
+        return ".".join(parts[-2:]) if len(parts) >= 2 else host
+    except Exception:
+        return ""
+
+def _kc_read_index() -> list:
+    try:
+        _kc_ensure_exists()
+        r = subprocess.run(
+            ["/usr/bin/security", "find-generic-password",
+             "-s", KC_INDEX_SERVICE, "-a", KC_INDEX_ACCOUNT, "-w",
+             KC_PATH],
+            capture_output=True, text=True, timeout=4)
+        if r.returncode != 0: return []
+        s = (r.stdout or "").rstrip("\n")
+        if not s: return []
+        return json.loads(s)
+    except Exception:
+        return []
+
+def _kc_write_index(idx: list) -> None:
+    _kc_ensure_exists()
+    blob = json.dumps(idx, separators=(",", ":"))
+    subprocess.run(
+        ["/usr/bin/security", "add-generic-password",
+         "-s", KC_INDEX_SERVICE, "-a", KC_INDEX_ACCOUNT, "-w", blob,
+         "-U", "-T", "/usr/bin/security",
+         KC_PATH],
+        check=True, timeout=4, capture_output=True, text=True)
+
+def _kc_get_password(site: str, account: str) -> str | None:
+    _kc_ensure_exists()
+    r = subprocess.run(
+        ["/usr/bin/security", "find-internet-password",
+         "-s", _kc_service_for(site), "-a", account, "-w",
+         KC_PATH],
+        capture_output=True, text=True, timeout=5)
+    if r.returncode != 0: return None
+    return (r.stdout or "").rstrip("\n")
+
+def _kc_set_password(site: str, account: str, password: str) -> None:
+    _kc_ensure_exists()
+    subprocess.run(
+        ["/usr/bin/security", "add-internet-password",
+         "-s", _kc_service_for(site), "-a", account, "-w", password,
+         "-U", "-T", "/usr/bin/security",
+         KC_PATH],
+        check=True, timeout=5, capture_output=True, text=True)
+
+def _kc_delete(site: str, account: str) -> None:
+    _kc_ensure_exists()
+    subprocess.run(
+        ["/usr/bin/security", "delete-internet-password",
+         "-s", _kc_service_for(site), "-a", account,
+         KC_PATH],
+        capture_output=True, text=True, timeout=4)
+
+@app.get("/api/credentials")
+async def list_credentials():
+    """List saved credentials (no passwords, just site + account)."""
+    try:
+        idx = _kc_read_index()
+        # Also suggest the current page's site as the default "save under" target
+        suggested_site = ""
+        try:
+            tab = await call("get_active_tab", {})
+            if isinstance(tab, dict) and tab.get("url"):
+                suggested_site = _site_from_url(tab["url"])
+        except Exception: pass
+        return {"items": idx, "suggested_site": suggested_site}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.post("/api/credentials/save")
+async def save_credential(req: Request):
+    """Body: {site, account, password}. site may be omitted → derived from current URL."""
+    body = await req.json()
+    site    = (body.get("site") or "").strip()
+    account = (body.get("account") or "").strip()
+    password = body.get("password") or ""
+    if not account or not password:
+        return JSONResponse({"error": "account and password required"}, status_code=400)
+    if not site:
+        try:
+            tab = await call("get_active_tab", {})
+            if isinstance(tab, dict) and tab.get("url"):
+                site = _site_from_url(tab["url"])
+        except Exception: pass
+    if not site:
+        return JSONResponse({"error": "site required (couldn't infer from active tab)"}, status_code=400)
+
+    try:
+        _kc_set_password(site, account, password)
+    except subprocess.CalledProcessError as e:
+        return JSONResponse({"error": f"keychain save failed: {e.stderr or e}"}, status_code=500)
+
+    # Update the index (idempotent)
+    idx = _kc_read_index()
+    idx = [e for e in idx if not (e.get("site") == site and e.get("account") == account)]
+    idx.append({"site": site, "account": account})
+    idx.sort(key=lambda e: (e.get("site",""), e.get("account","")))
+    try: _kc_write_index(idx)
+    except Exception: pass
+    return {"ok": True, "site": site, "account": account, "total": len(idx)}
+
+@app.post("/api/credentials/delete")
+async def delete_credential(req: Request):
+    body = await req.json()
+    site = (body.get("site") or "").strip()
+    account = (body.get("account") or "").strip()
+    if not site or not account:
+        return JSONResponse({"error": "site and account required"}, status_code=400)
+    _kc_delete(site, account)
+    idx = _kc_read_index()
+    idx = [e for e in idx if not (e.get("site") == site and e.get("account") == account)]
+    try: _kc_write_index(idx)
+    except Exception: pass
+    return {"ok": True}
+
+@app.post("/api/login_step_saved")
+async def login_step_saved(req: Request):
+    """Like /api/login_step but pulls password from macOS Keychain.
+    Body: {site, account}. Never returns the password to the client."""
+    body = await req.json()
+    site = (body.get("site") or "").strip()
+    account = (body.get("account") or "").strip()
+    if not site or not account:
+        return JSONResponse({"error": "site and account required"}, status_code=400)
+    password = _kc_get_password(site, account)
+    if password is None:
+        return JSONResponse({"error": f"no saved credential for {account}@{site}"}, status_code=404)
+    # Re-issue login_step with credentials populated server-side.
+    class _FakeReq:
+        def __init__(self, body): self._body = body
+        async def json(self): return self._body
+    return await login_step(_FakeReq({"email": account, "password": password}))
 
 @app.post("/api/navigate")
 async def navigate(req: Request):
