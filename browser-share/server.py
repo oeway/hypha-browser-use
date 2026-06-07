@@ -263,28 +263,82 @@ async def login_step(req: Request):
             return {"step": "password_needed", "url": url, "title": title,
                     "message": "Password field is visible — provide password."}
         actions = []
-        # KTH ADFS / some Microsoft pages have a hidden userNameInput that must
-        # ALSO carry the username — get_browser_state skips invisible elements
-        # so we use a CSS-selector query to find + fill them.
+        # Some Microsoft/ADFS pages have a hidden username field that posts
+        # alongside password. Set value with BOTH the setter AND setAttribute
+        # in one atomic call (some pages re-read getAttribute('value') during
+        # submit). Do this BEFORE filling password so the page's submit
+        # handler sees a complete form.
         if email:
-            for sel in ("#userNameInput",
-                        "input[name=UserName]",
-                        "input[name=loginfmt]",
-                        "input[name=Username]",
-                        "input[name=username]"):
-                try:
-                    r = await call("fill", {"selector": sel, "value": email})
-                    if isinstance(r, dict) and r.get("ok"):
-                        actions.append(f"filled hidden username via {sel}")
-                        break
-                except Exception: continue
-        # Now the visible password field
-        await call("click_by_index", {"index": p_el["index"]})
-        await call("input_by_index", {"index": p_el["index"], "text": password})
-        actions.append("filled password")
-        if s_el is not None:
-            await call("click_by_index", {"index": s_el["index"]})
+            import json as _j
+            email_js = _j.dumps(email)
+            user_fill_code = (
+                "(() => {"
+                "  const selectors = ['#userNameInput','input[name=UserName]',"
+                "    'input[name=loginfmt]','input[name=Username]','input[name=username]'];"
+                "  let target = null;"
+                "  for (const s of selectors) { const el = document.querySelector(s);"
+                "    if (el && el.tagName === 'INPUT') { target = el; break; } }"
+                "  if (!target) return {ok:false, error:'no username input on page'};"
+                "  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;"
+                f" const v = {email_js};"
+                "  setter.call(target, v);"
+                "  target.setAttribute('value', v);"
+                "  target.dispatchEvent(new Event('input',  {bubbles:true}));"
+                "  target.dispatchEvent(new Event('change', {bubbles:true}));"
+                "  return {ok:true, id: target.id, name: target.name, value: target.value};"
+                "})()"
+            )
+            try:
+                r = await call("eval_js", {"code": f"return {user_fill_code};"})
+                if isinstance(r, dict) and isinstance(r.get("value"), dict):
+                    inner = r["value"]
+                    if inner.get("ok"):
+                        actions.append(f"filled hidden username #{inner.get('id')}={inner.get('value')}")
+                    else:
+                        actions.append({"op": "username", "error": inner.get("error")})
+                else:
+                    actions.append({"op": "username", "error": "eval_js bad shape"})
+            except Exception as e:
+                actions.append({"op": "username", "error": str(e)})
+        # Now the visible password field — use the SAME atomic pattern so
+        # the value isn't cleared by an intervening render.
+        import json as _j
+        pw_js = _j.dumps(password)
+        pw_fill_code = (
+            "(() => {"
+            "  const el = document.querySelector('input[type=password]');"
+            "  if (!el) return {ok:false, error:'no password input'};"
+            "  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;"
+            f" setter.call(el, {pw_js});"
+            "  el.dispatchEvent(new Event('input',  {bubbles:true}));"
+            "  el.dispatchEvent(new Event('change', {bubbles:true}));"
+            "  return {ok:true, length: el.value.length};"
+            "})()"
+        )
+        try:
+            r = await call("eval_js", {"code": f"return {pw_fill_code};"})
+            actions.append("filled password")
+        except Exception as e:
+            actions.append({"op": "password", "error": str(e)})
+        # Click the actual submit button — preferring the page's own submit
+        # function if exposed (handles validation + form.submit() correctly).
+        submit_code = (
+            "(() => {"
+            "  if (window.Login && typeof window.Login.submitLoginRequest === 'function') {"
+            "    return {via:'Login.submitLoginRequest', r: window.Login.submitLoginRequest()};"
+            "  }"
+            "  const btn = document.querySelector('#submitButton, button[type=submit], input[type=submit]');"
+            "  if (btn) { btn.click(); return {via:'btn.click', tag:btn.tagName, id:btn.id}; }"
+            "  const form = document.forms[0];"
+            "  if (form) { form.submit(); return {via:'form.submit'}; }"
+            "  return {ok:false, error:'no submit'};"
+            "})()"
+        )
+        try:
+            r = await call("eval_js", {"code": f"return {submit_code};"})
             actions.append("clicked submit")
+        except Exception as e:
+            actions.append({"op": "submit", "error": str(e)})
         return {"step": "password_submitted", "url": url, "title": title,
                 "actions": actions,
                 "message": "Password submitted — waiting for next step…"}
