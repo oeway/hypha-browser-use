@@ -917,6 +917,28 @@ bindTaps(shotbox, "box");
 // (e.g. cache replacement) keeps the handler attached.
 shot.onclick = (ev) => handleTap(ev, "img:prop");
 
+// ─── Document-level diagnostic ───
+// Any pointerup ANYWHERE in the iframe should show up. If the user taps the
+// screenshot and this fires but bindTaps(shot)/bindTaps(shotbox) do NOT,
+// something is eating the bubble. If even this doesn't fire, events aren't
+// reaching the iframe at all (sandbox issue) and you'll see no status update
+// from a screenshot tap either.
+document.addEventListener("pointerup", (ev) => {
+  const t = ev.target;
+  const tag = t && t.tagName;
+  const id = t && t.id;
+  const cls = t && t.className;
+  console.log("[doc] pointerup", { tag, id, cls, x: ev.clientX, y: ev.clientY });
+  // If the target is inside the shotbox but our shot/shotbox handlers
+  // didn't catch it, forward here as a last resort.
+  if (t && (t === shot || t === shotbox || shotbox.contains(t))) {
+    if (Date.now() - lastTap > 80) {
+      $("status").textContent = `(doc fallback) tap on <${tag||'?'}#${id||''}>`;
+      handleTap(ev, "doc:fallback");
+    }
+  }
+}, true);  // capture so we see it before anything else can stopPropagation
+
 // Forward keystrokes via TWO listeners:
 //   1) `input` event on the hidden kbd → captures both desktop and mobile typing.
 //      On mobile, native composition / autocorrect arrives as input events.
