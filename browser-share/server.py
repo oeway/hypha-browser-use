@@ -257,15 +257,31 @@ async def login_step(req: Request):
                 "number": twofa_num,
                 "message": f"Approve sign-in on your phone — tap the tile labeled “{twofa_num}”."}
 
-    # Password page
+    # Password page (possibly with a HIDDEN username field, e.g. KTH ADFS)
     if p_el is not None:
         if not password:
             return {"step": "password_needed", "url": url, "title": title,
                     "message": "Password field is visible — provide password."}
-        # Click the field first so it's focused, then paste
+        actions = []
+        # KTH ADFS / some Microsoft pages have a hidden userNameInput that must
+        # ALSO carry the username — get_browser_state skips invisible elements
+        # so we use a CSS-selector query to find + fill them.
+        if email:
+            for sel in ("#userNameInput",
+                        "input[name=UserName]",
+                        "input[name=loginfmt]",
+                        "input[name=Username]",
+                        "input[name=username]"):
+                try:
+                    r = await call("fill", {"selector": sel, "value": email})
+                    if isinstance(r, dict) and r.get("ok"):
+                        actions.append(f"filled hidden username via {sel}")
+                        break
+                except Exception: continue
+        # Now the visible password field
         await call("click_by_index", {"index": p_el["index"]})
         await call("input_by_index", {"index": p_el["index"], "text": password})
-        actions = ["filled password"]
+        actions.append("filled password")
         if s_el is not None:
             await call("click_by_index", {"index": s_el["index"]})
             actions.append("clicked submit")

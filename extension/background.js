@@ -593,11 +593,21 @@ async function get_browser_state({ tab_id = null, viewport_only = true } = {}) {
       if (cs.cursor === "pointer") return true;
       return false;
     };
+    const isFormFillable = (el) => {
+      const tag = el.tagName;
+      if (tag === "TEXTAREA" || tag === "SELECT") return true;
+      if (tag !== "INPUT") return false;
+      const t = (el.type || "").toLowerCase();
+      return ["text","email","password","tel","number","search","url",""].includes(t);
+    };
     const isVisible = (el) => {
       const r = el.getBoundingClientRect();
-      if (r.width <= 0 || r.height <= 0) return false;
+      // Keep form-fillable inputs even when CSS-hidden (KTH ADFS has a
+      // 0×0 username field on its combined password page).
+      if (r.width <= 0 || r.height <= 0) return isFormFillable(el);
       const cs = getComputedStyle(el);
-      if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) === 0) return false;
+      if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) === 0)
+        return isFormFillable(el);
       return true;
     };
     const inViewport = (el) => {
