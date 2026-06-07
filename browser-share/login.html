@@ -85,7 +85,16 @@
     aspect-ratio: 1440 / 813;  /* matches Chrome viewport — adjusts via JS once image loads */
   }
   .shotbox.focused { box-shadow: inset 0 0 0 3px var(--accent); }
-  .shot { display: block; width: 100%; height: auto; cursor: crosshair; user-select: none; }
+  .shot {
+    display: block; width: 100%; height: auto; cursor: crosshair;
+    user-select: none;
+    /* eliminate 300ms click delay AND tell iOS this is a tap target,
+       NOT a zoomable/draggable element */
+    touch-action: manipulation;
+    -webkit-touch-callout: none;
+    pointer-events: auto;
+  }
+  .shotbox { touch-action: manipulation; }
   .shotbox .loading {
     position: absolute; inset: 0; display: grid; place-items: center;
     color: #888; font-size: 12px; pointer-events: none;
@@ -747,10 +756,10 @@ shot.addEventListener("touchend", (e) => {
   setTimeout(refreshShot, 800);
 }, { passive: false });
 
-// Only suppress click if a real swipe just ended (window of ~200ms).
-shot.addEventListener("click", (e) => {
-  if (swipeJustHappened) { e.preventDefault(); e.stopPropagation(); }
-}, true);
+// (We previously had a capture-phase click suppressor here for after-swipe
+// fake clicks. Removed — it was eating legitimate taps when swipeJustHappened
+// stayed true due to event ordering. Live with the rare extra-click after a
+// scroll-swipe; it's strictly better than dropping real taps.)
 
 // Desktop mouse wheel scroll
 shot.addEventListener("wheel", (e) => {
@@ -838,50 +847,75 @@ async function doRemoteClick(clientX, clientY) {
   setTimeout(refreshState, 1200);
 }
 
-// Tap handler bound to the SCREENSHOT (the image), not the kbd input.
-// On tap we synchronously focus the off-screen kbd input so the iOS keyboard
-// opens, then send the click coordinates to the remote browser.
+// ─── Dead-simple tap handler ───
+// Bind to BOTH the image and the shotbox via pointerup (covers mouse+touch
+// in one event), plus click (synthesized from touchend on iOS) and explicit
+// touchend. De-dup via 80ms gate. Status updates IMMEDIATELY for visibility.
 let lastTap = 0;
-function onShotTap(ev) {
+function handleTap(ev, source) {
   const now = Date.now();
-  // Loose debounce so very-fast double-fires don't double-click,
-  // but real successive taps aren't blocked.
   if (now - lastTap < 80) return;
   lastTap = now;
 
+  // Extract coords from whichever event type fired.
   let cx, cy;
   if (ev.changedTouches && ev.changedTouches[0]) {
     cx = ev.changedTouches[0].clientX;
     cy = ev.changedTouches[0].clientY;
-  } else if (ev.clientX != null) {
+  } else if (ev.clientX != null && ev.clientY != null) {
     cx = ev.clientX; cy = ev.clientY;
   } else {
-    return;  // ignore events with no coords (focus, etc.)
+    return;
   }
-  if (ev.cancelable) ev.preventDefault();
+  if (ev.cancelable) { try { ev.preventDefault(); } catch(_) {} }
 
-  // SYNCHRONOUS focus — must happen in the user gesture for iOS to open keyboard
-  kbd.value = "";
-  try { kbd.focus({ preventScroll: true }); } catch(e) { try { kbd.focus(); } catch(_){} }
-  setFocus(true);
+  // SYNC focus the keyboard input — must be in the user gesture for iOS.
+  try { kbd.value = ""; kbd.focus({ preventScroll: true }); setFocus(true); } catch(_) {}
 
-  // IMMEDIATE visible feedback so we always know the tap was caught,
-  // even if the API call is slow.
-  const xyHint = shotXY(cx, cy);
-  $("status").textContent = `→ tap at viewport (${xyHint.x}, ${xyHint.y})…`;
-  spawnRipple(shotbox, xyHint.lx, xyHint.ly);
+  // Map to remote viewport.
+  const rect = shot.getBoundingClientRect();
+  if (rect.width < 1 || rect.height < 1) {
+    $("status").textContent = `tap[${source}] @ (${cx},${cy}) — but shot has no size`;
+    return;
+  }
+  const px = cx - rect.left, py = cy - rect.top;
+  const natW = shot.naturalWidth  || 1440;
+  const natH = shot.naturalHeight || 813;
+  const x = Math.max(0, Math.min(natW - 1, Math.round(px * (natW / rect.width))));
+  const y = Math.max(0, Math.min(natH - 1, Math.round(py * (natH / rect.height))));
 
-  doRemoteClick(cx, cy);
+  // INSTANT visible feedback (status + ripple) BEFORE any await.
+  $("status").textContent = `tap[${source}] @ (${x}, ${y})…`;
+  const boxRect = shotbox.getBoundingClientRect();
+  spawnRipple(shotbox, cx - boxRect.left, cy - boxRect.top);
+
+  // POST the click. Don't await — fire-and-forget so the UI feels snappy.
+  post("/api/click_at", { x, y }).then((r) => {
+    $("detail").textContent = JSON.stringify(r, null, 2);
+    const info = r && (r.value || r);
+    if (info && info.tag) {
+      $("status").textContent = `✓ ${info.tag.toLowerCase()}${info.text ? " “"+info.text.trim().slice(0,40)+"”" : ""}`;
+    }
+  }).catch((e) => { $("status").textContent = `click err: ${e.message}`; });
+  setTimeout(refreshShot, 280);
+  setTimeout(refreshShot, 900);
+  setTimeout(refreshState, 1200);
 }
 
-// Bind broadly: image + shotbox + kbd (which may sit on top because of z-index).
-shot.addEventListener("click",    onShotTap);
-shot.addEventListener("touchend", onShotTap, { passive: false });
-shotbox.addEventListener("click",    (ev) => { if (ev.target !== shot) onShotTap(ev); });
-shotbox.addEventListener("touchend", (ev) => { if (ev.target !== shot) onShotTap(ev); }, { passive: false });
-// Some browsers route synthesized clicks to the topmost element; the kbd
-// (1×1 fixed) shouldn't match real taps, but if anything inside shotbox
-// captures, the shotbox handler above will still pick it up.
+// Bind via every reliable mechanism. `pointerup` is the modern one that
+// covers mouse + touch in a single event. Click is the synthesized fallback.
+// We bind on both `shot` AND `shotbox` so events that land in any padding
+// area still get handled.
+function bindTaps(el, label) {
+  el.addEventListener("pointerup", (ev) => handleTap(ev, label + ":pointer"));
+  el.addEventListener("click",     (ev) => handleTap(ev, label + ":click"));
+  el.addEventListener("touchend",  (ev) => handleTap(ev, label + ":touch"), { passive: false });
+}
+bindTaps(shot, "img");
+bindTaps(shotbox, "box");
+// Inline fallback on the <img> tag — bound as a property so a fresh load
+// (e.g. cache replacement) keeps the handler attached.
+shot.onclick = (ev) => handleTap(ev, "img:prop");
 
 // Forward keystrokes via TWO listeners:
 //   1) `input` event on the hidden kbd → captures both desktop and mobile typing.
