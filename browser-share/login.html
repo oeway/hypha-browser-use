@@ -844,26 +844,44 @@ async function doRemoteClick(clientX, clientY) {
 let lastTap = 0;
 function onShotTap(ev) {
   const now = Date.now();
-  if (now - lastTap < 200) return;
+  // Loose debounce so very-fast double-fires don't double-click,
+  // but real successive taps aren't blocked.
+  if (now - lastTap < 80) return;
   lastTap = now;
+
   let cx, cy;
   if (ev.changedTouches && ev.changedTouches[0]) {
     cx = ev.changedTouches[0].clientX;
     cy = ev.changedTouches[0].clientY;
-  } else { cx = ev.clientX; cy = ev.clientY; }
+  } else if (ev.clientX != null) {
+    cx = ev.clientX; cy = ev.clientY;
+  } else {
+    return;  // ignore events with no coords (focus, etc.)
+  }
   if (ev.cancelable) ev.preventDefault();
+
   // SYNCHRONOUS focus — must happen in the user gesture for iOS to open keyboard
   kbd.value = "";
-  try { kbd.focus({ preventScroll: true }); } catch(e) { kbd.focus(); }
+  try { kbd.focus({ preventScroll: true }); } catch(e) { try { kbd.focus(); } catch(_){} }
   setFocus(true);
+
+  // IMMEDIATE visible feedback so we always know the tap was caught,
+  // even if the API call is slow.
+  const xyHint = shotXY(cx, cy);
+  $("status").textContent = `→ tap at viewport (${xyHint.x}, ${xyHint.y})…`;
+  spawnRipple(shotbox, xyHint.lx, xyHint.ly);
+
   doRemoteClick(cx, cy);
 }
-// Bind on the IMAGE itself so iOS doesn't show paste menu over the screen.
+
+// Bind broadly: image + shotbox + kbd (which may sit on top because of z-index).
 shot.addEventListener("click",    onShotTap);
 shot.addEventListener("touchend", onShotTap, { passive: false });
-// Also catch taps that hit the shotbox padding (rare with aspect-ratio set)
-shotbox.addEventListener("click",    (ev) => { if (ev.target === shotbox) onShotTap(ev); });
-shotbox.addEventListener("touchend", (ev) => { if (ev.target === shotbox) onShotTap(ev); }, { passive: false });
+shotbox.addEventListener("click",    (ev) => { if (ev.target !== shot) onShotTap(ev); });
+shotbox.addEventListener("touchend", (ev) => { if (ev.target !== shot) onShotTap(ev); }, { passive: false });
+// Some browsers route synthesized clicks to the topmost element; the kbd
+// (1×1 fixed) shouldn't match real taps, but if anything inside shotbox
+// captures, the shotbox handler above will still pick it up.
 
 // Forward keystrokes via TWO listeners:
 //   1) `input` event on the hidden kbd → captures both desktop and mobile typing.
