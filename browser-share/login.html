@@ -96,6 +96,26 @@
     border-radius: 999px; opacity: 0; transition: opacity .15s;
     pointer-events: none; font-weight: 500;
   }
+  /* Big 2FA number overlay for when MS Authenticator number-match appears */
+  .twofa {
+    position: absolute; inset: 0; display: none; flex-direction: column;
+    align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.78); color: white; z-index: 10;
+    text-align: center; padding: 24px; box-sizing: border-box;
+  }
+  .twofa.show { display: flex; }
+  .twofa .label { font-size: 14px; opacity: 0.8; margin-bottom: 6px; }
+  .twofa .num {
+    font-size: 96px; font-weight: 700; line-height: 1.05;
+    letter-spacing: -0.04em; text-shadow: 0 4px 18px rgba(80,80,255,0.3);
+    margin: 6px 0;
+  }
+  .twofa .hint { font-size: 13px; opacity: 0.7; max-width: 340px; }
+  .twofa button {
+    margin-top: 12px; background: rgba(255,255,255,0.18); color: white;
+    border: 1px solid rgba(255,255,255,0.4); padding: 6px 12px;
+    border-radius: 6px; font-size: 12px;
+  }
   .shotbox.focused .focusbadge { opacity: 1; }
   .shotbox:not(.focused) .focusbadge.hint { opacity: 0.7; background: #666; }
   .ripple {
@@ -191,6 +211,13 @@
            aria-label="forwards typing to the remote browser">
     <span class="focusbadge hint" id="focusbadge">tap to type</span>
     <div class="loading" id="loading">loading screenshot…</div>
+    <!-- Big 2FA number overlay shown when MS Authenticator number-match appears -->
+    <div class="twofa" id="twofa">
+      <div class="label">Approve on your phone</div>
+      <div class="num" id="twofaNum">—</div>
+      <div class="hint">Open Microsoft Authenticator on your phone and tap the tile with this number.</div>
+      <button id="twofaClose">Got it</button>
+    </div>
   </div>
 
   <div class="panel">
@@ -347,9 +374,85 @@ async function doFill({ withEmail, withPw, submit }) {
   }
 }
 
-$("submit").onclick   = () => doFill({ withEmail: true,  withPw: true,  submit: true });
+// "Sign in →" now runs the FULL multi-step orchestrator. Single press handles:
+//   email page → password page → 2FA prompt (number shown big) → logged in.
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+let loginRunning = false;
+
+async function runLoginFlow() {
+  if (loginRunning) { $("status").textContent = "(login flow already running)"; return; }
+  const email = $("email").value.trim();
+  const password = $("pw").value;
+  if (!email && !password) {
+    $("status").textContent = "Type email and/or password first.";
+    return;
+  }
+  loginRunning = true;
+  $("submit").disabled = true; $("fillEmail").disabled = true; $("fillPw").disabled = true;
+  $("status").textContent = "Starting login flow…";
+  $("twofa").classList.remove("show");
+
+  const start = Date.now();
+  let lastStep = "", sameStepCount = 0, twofaShown = false;
+  try {
+    while (Date.now() - start < 180_000) {       // 3-minute hard cap
+      let r;
+      try { r = await post("/api/login_step", { email, password }); }
+      catch (e) { $("status").textContent = "step err: " + e.message; break; }
+      $("detail").textContent = JSON.stringify(r, null, 2);
+
+      const step = r.step || "?";
+      $("status").textContent = `[${step}] ${r.message || ""}`;
+      sameStepCount = (step === lastStep) ? sameStepCount + 1 : 0;
+      lastStep = step;
+
+      // Force a screenshot refresh after every step
+      refreshShot(); refreshState();
+
+      if (step === "complete") {
+        $("status").textContent = "✓ Logged in — " + (r.title || r.url || "");
+        $("pw").value = "";     // clear password on success
+        $("twofa").classList.remove("show");
+        break;
+      }
+      if (step === "error") {
+        $("status").textContent = "✗ " + (r.error || r.message);
+        break;
+      }
+      if (step === "2fa_waiting") {
+        if (!twofaShown) {
+          $("twofaNum").textContent = r.number || "?";
+          $("twofa").classList.add("show");
+          twofaShown = true;
+          // also fire a native macOS notification on the remote machine
+          post("/api/notify", { message: "KTH: Approve sign-in with " + r.number,
+                                level: "info" }).catch(()=>{});
+        }
+        await sleep(2500);
+        continue;
+      }
+      if (step === "email_needed" && !email) { $("status").textContent = "Email required"; break; }
+      if (step === "password_needed" && !password) { $("status").textContent = "Password required"; break; }
+      if (step === "no_page") { $("status").textContent = r.message; break; }
+
+      // Same step too many times → page likely stuck
+      if (sameStepCount > 6) {
+        $("status").textContent = `Stuck at ${step} after ${sameStepCount} polls — check the screen.`;
+        break;
+      }
+      await sleep(step.endsWith("submitted") ? 1800 : 900);
+    }
+  } finally {
+    loginRunning = false;
+    $("submit").disabled = false; $("fillEmail").disabled = false; $("fillPw").disabled = false;
+  }
+}
+
+$("submit").onclick    = () => runLoginFlow();
 $("fillEmail").onclick = () => doFill({ withEmail: true,  withPw: false, submit: true });
 $("fillPw").onclick    = () => doFill({ withEmail: false, withPw: true,  submit: true });
+$("twofaClose").onclick = () => $("twofa").classList.remove("show");
 $("refresh").onclick   = () => { refreshShot(); refreshState(); };
 // "📱 Keyboard": force-focus the hidden input so mobile soft-keyboard appears.
 // Must fire synchronously inside the click handler (no awaits before focus).

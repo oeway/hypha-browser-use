@@ -173,6 +173,132 @@ async def get_state():
             out["warning"] = (out["warning"] + "; " if out["warning"] else "") + f"browser_state: {e}"
     return out
 
+# ───────── Multi-step login orchestrator ───────── #
+def _detect_2fa_number(elements):
+    """Look for the MS Authenticator number-match digit on the page.
+    Returns the number as a string, or None.
+    Heuristic: a small visible element whose text is 1-3 digits and which
+    occupies a reasonably large bbox (it's typically rendered big)."""
+    candidates = []
+    for e in elements:
+        text = (e.get("text") or "").strip()
+        if not (text.isdigit() and 1 <= len(text) <= 3):
+            continue
+        bbox = e.get("bbox") or {}
+        w = bbox.get("w", 0); h = bbox.get("h", 0)
+        if w < 20 or h < 20: continue
+        attrs = e.get("attrs", {}) or {}
+        # Prioritize elements with hinting attributes
+        score = w * h
+        if "sign" in (attrs.get("id","") + attrs.get("class","") + attrs.get("data-bind","")).lower():
+            score *= 10
+        if attrs.get("aria-live"):
+            score *= 5
+        candidates.append((score, text, e))
+    if not candidates: return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+def _detect_error_message(elements):
+    """Find a visible error message on the page (e.g. 'Wrong password')."""
+    for e in elements:
+        text = (e.get("text") or "").strip().lower()
+        attrs = e.get("attrs", {}) or {}
+        cls = (attrs.get("class") or "").lower()
+        idattr = (attrs.get("id") or "").lower()
+        if any(k in cls + " " + idattr for k in ("error", "alert", "validation")):
+            if text and len(text) < 200 and len(text) > 5:
+                return e.get("text", "").strip()
+        if any(k in text for k in ("incorrect password","wrong password","invalid","not match",
+                                    "could not find","does not exist","try again")):
+            if len(text) < 200: return e.get("text", "").strip()
+    return None
+
+@app.post("/api/login_step")
+async def login_step(req: Request):
+    """One step of an orchestrated multi-page login flow.
+
+    Body: {email?, password?}
+
+    Looks at the current page state and decides what to do:
+    - email field present → fill (if email given) and click submit
+    - password field present → fill (if password given) and click submit
+    - 2FA number visible → return the number for the user to approve on phone
+    - logged-in / unknown → return state info
+
+    The client polls this until step == "complete" or "needs_human".
+    """
+    body = await req.json()
+    email = body.get("email")
+    password = body.get("password")
+
+    info = await call("get_page_info", {})
+    url = (info or {}).get("url", "")
+    title = (info or {}).get("title", "")
+
+    # If we're on a non-actionable URL (about:blank, chrome://), bail out.
+    if url.startswith(("about:", "chrome:", "chrome-extension:", "edge:", "view-source:")):
+        return {"step": "no_page", "url": url, "title": title,
+                "message": "No real page loaded — navigate first."}
+
+    bs = await call("get_browser_state", {"viewport_only": True})
+    elements = bs.get("elements", []) if isinstance(bs, dict) else []
+    e_el, p_el, s_el = _classify_elements(elements)
+    err = _detect_error_message(elements)
+    if err:
+        return {"step": "error", "url": url, "title": title, "error": err,
+                "message": f"Page reports: {err}"}
+
+    # Check: are we on a 2FA number-match prompt?
+    is_msft_url = "microsoftonline.com" in url or "login.live.com" in url
+    twofa_num = _detect_2fa_number(elements)
+    if twofa_num and (is_msft_url or "approve" in title.lower() or "sign in" in title.lower()):
+        return {"step": "2fa_waiting", "url": url, "title": title,
+                "number": twofa_num,
+                "message": f"Approve sign-in on your phone — tap the tile labeled “{twofa_num}”."}
+
+    # Password page
+    if p_el is not None:
+        if not password:
+            return {"step": "password_needed", "url": url, "title": title,
+                    "message": "Password field is visible — provide password."}
+        # Click the field first so it's focused, then paste
+        await call("click_by_index", {"index": p_el["index"]})
+        await call("input_by_index", {"index": p_el["index"], "text": password})
+        actions = ["filled password"]
+        if s_el is not None:
+            await call("click_by_index", {"index": s_el["index"]})
+            actions.append("clicked submit")
+        return {"step": "password_submitted", "url": url, "title": title,
+                "actions": actions,
+                "message": "Password submitted — waiting for next step…"}
+
+    # Email page
+    if e_el is not None:
+        if not email:
+            return {"step": "email_needed", "url": url, "title": title,
+                    "message": "Email field is visible — provide email."}
+        await call("click_by_index", {"index": e_el["index"]})
+        await call("input_by_index", {"index": e_el["index"], "text": email})
+        actions = ["filled email"]
+        if s_el is not None:
+            await call("click_by_index", {"index": s_el["index"]})
+            actions.append("clicked submit")
+        return {"step": "email_submitted", "url": url, "title": title,
+                "actions": actions,
+                "message": "Email submitted — waiting for password page…"}
+
+    # No login fields detected — either logged in OR still loading
+    on_login_host = any(h in url for h in ("login.microsoftonline.com", "login.kth.se",
+                                            "login.live.com", "accounts.google.com",
+                                            "/adfs/", "/oauth2/"))
+    if not on_login_host:
+        return {"step": "complete", "url": url, "title": title,
+                "message": f"Logged in (or no login page) — {title}"}
+
+    return {"step": "waiting", "url": url, "title": title, "element_count": len(elements),
+            "message": "Login page detected but no actionable fields — page may still be loading."}
+
 @app.post("/api/fill")
 async def fill_and_submit(req: Request):
     """Fill any provided fields, then click the most likely submit button.
@@ -273,6 +399,16 @@ async def api_activate_tab(req: Request):
 async def api_tabs():
     try:
         return await call("list_tabs", {})
+    except Exception as e: return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.post("/api/notify")
+async def api_notify(req: Request):
+    body = await req.json()
+    try:
+        return await call("notify_user", {
+            "message": body.get("message", ""),
+            "level":   body.get("level", "info"),
+        })
     except Exception as e: return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.post("/api/navigate")
