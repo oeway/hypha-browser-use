@@ -536,6 +536,24 @@ runLoginFlow = async function(opts = {}) {
   $("status").textContent = usingSaved ? `Starting saved login for ${email}…` : "Starting login flow…";
   $("twofa").classList.remove("show");
 
+  // IMMEDIATE SAVE: if the user ticked "save credentials", persist them right
+  // now — before the flow runs. That way, even if the flow gets stuck or the
+  // user closes the panel mid-2FA, the credentials are already in the
+  // keychain for next time (and the saved-logins list refreshes).
+  let savedEarly = false;
+  if (!usingSaved && $("saveCreds").checked && email && password_input) {
+    try {
+      const saveRes = await post("/api/credentials/save", { account: email, password: password_input });
+      if (saveRes.ok) {
+        savedEarly = true;
+        $("status").textContent = `✓ Saved to Keychain (${saveRes.site}). Starting login…`;
+        refreshSaved();
+      } else {
+        $("status").textContent = "save failed: " + (saveRes.error || "?");
+      }
+    } catch (e) { $("status").textContent = "save err: " + e.message; }
+  }
+
   const start = Date.now();
   let lastStep = "", sameStepCount = 0, twofaShown = false;
   let completedOk = false;
@@ -583,19 +601,11 @@ runLoginFlow = async function(opts = {}) {
       await sleep(step.endsWith("submitted") ? 1800 : 900);
     }
 
-    // On successful manual login, optionally save to Keychain.
-    if (completedOk && !usingSaved && $("saveCreds").checked && email && password_input) {
-      try {
-        const saveRes = await post("/api/credentials/save", { account: email, password: password_input });
-        if (saveRes.ok) {
-          $("status").textContent += `  ·  saved to Keychain (${saveRes.site})`;
-          $("pw").value = "";
-          $("saveCreds").checked = false;
-          refreshSaved();
-        }
-      } catch (e) { /* non-fatal */ }
-    } else if (completedOk) {
-      $("pw").value = "";  // clear typed password regardless
+    // Clear the password field after the flow (whether it succeeded or not).
+    // Already-saved credentials live in the Keychain.
+    if (completedOk || savedEarly) {
+      $("pw").value = "";
+      $("saveCreds").checked = false;
     }
   } finally {
     loginRunning = false;

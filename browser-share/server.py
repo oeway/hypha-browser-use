@@ -242,6 +242,17 @@ async def login_step(req: Request):
         return {"step": "no_page", "url": url, "title": title,
                 "message": "No real page loaded — navigate first."}
 
+    # FIRST: are we already past all known login hosts? Treat as complete.
+    # Otherwise the orchestrator can mistake post-login search boxes for
+    # email inputs and start typing creds into them (real bug observed).
+    on_login_host = any(h in url for h in ("login.microsoftonline.com", "login.kth.se",
+                                            "login.live.com", "accounts.google.com",
+                                            "/adfs/", "/oauth2/", "login.live.net",
+                                            "okta.com", "auth0.com", "/saml", "/sso/"))
+    if not on_login_host:
+        return {"step": "complete", "url": url, "title": title,
+                "message": f"Logged in (off any login host) — {title}"}
+
     bs = await call("get_browser_state", {"viewport_only": True})
     elements = bs.get("elements", []) if isinstance(bs, dict) else []
     e_el, p_el, s_el = _classify_elements(elements)
